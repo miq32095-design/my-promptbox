@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PromptBox</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="#/">
+          <span class="brand-mark">PB</span>
+          <span>
+            <strong>PromptBox</strong>
+            <small>个人 Prompt 知识库</small>
+          </span>
+        </a>
+        <nav class="nav" aria-label="主导航">
+          <a data-route="/" href="#/">首页</a>
+          <a data-route="/prompts" href="#/prompts">Prompt</a>
+          <a data-route="/edit" href="#/edit">新建</a>
+          <a data-route="/categories" href="#/categories">分类</a>
+          <a data-route="/settings" href="#/settings">设置</a>
+        </nav>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Design Student Workspace</p>
+            <h1 id="pageTitle">PromptBox</h1>
+          </div>
+          <a class="primary-action" href="#/edit">+ 新建 Prompt</a>
+        </header>
+        <section id="app" class="view" aria-live="polite"></section>
+      </main>
+
+      <nav class="mobile-nav" aria-label="移动端导航">
+        <a data-route="/" href="#/">首页</a>
+        <a data-route="/prompts" href="#/prompts">列表</a>
+        <a data-route="/edit" href="#/edit">新建</a>
+        <a data-route="/categories" href="#/categories">分类</a>
+        <a data-route="/settings" href="#/settings">设置</a>
+      </nav>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="./app.js"></script>
+  </body>
+</html>
