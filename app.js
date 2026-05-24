@@ -1,4 +1,6 @@
-const STORAGE_KEY = "promptbox:data:v1";
+const STORAGE_KEY = "promptbox_prompts";
+const LEGACY_STORAGE_KEYS = ["promptbox:data:v1", "prompts", "promptbox-data", "promptboxData"];
+const MIGRATION_KEY = "promptbox_storage_migrated_v1";
 const DEFAULT_CATEGORIES = ["绘图", "写作", "PPT", "编程", "产品设计", "电商图", "其他"];
 
 const state = {
@@ -13,6 +15,7 @@ const state = {
     enabled: false,
     selected: new Set(),
   },
+  returnContext: null,
 };
 
 const app = document.querySelector("#app");
@@ -65,37 +68,111 @@ function normalizePrompt(prompt = {}) {
   };
 }
 
-function load() {
-  const raw = localStorage.getItem(STORAGE_KEY);
-  if (!raw) {
-    state.categories = [...DEFAULT_CATEGORIES];
-    state.prompts = seedPrompts();
-    save();
-    return;
-  }
+function normalizeData(data = {}) {
+  const prompts = Array.isArray(data)
+    ? data.map(normalizePrompt)
+    : Array.isArray(data.prompts)
+      ? data.prompts.map(normalizePrompt)
+      : [];
+  const promptCategories = prompts.map((prompt) => prompt.category).filter(Boolean);
+  const categories = Array.isArray(data.categories) && data.categories.length
+    ? data.categories
+    : [...DEFAULT_CATEGORIES, ...promptCategories];
+
+  return {
+    categories: [...new Set(categories)],
+    prompts,
+  };
+}
+
+function readStorageData(key) {
+  const raw = localStorage.getItem(key);
+  if (!raw) return null;
 
   try {
-    const parsed = JSON.parse(raw);
-    state.categories = Array.isArray(parsed.categories) && parsed.categories.length
-      ? parsed.categories
-      : [...DEFAULT_CATEGORIES];
-    state.prompts = Array.isArray(parsed.prompts) ? parsed.prompts.map(normalizePrompt) : [];
-    save();
-  } catch {
-    state.categories = [...DEFAULT_CATEGORIES];
-    state.prompts = [];
+    return normalizeData(JSON.parse(raw));
+  } catch (error) {
+    console.error("读取 Prompt 数据失败", error);
+    return null;
   }
 }
 
-function save() {
+function mergeDataSets(...sets) {
+  const categories = new Set(DEFAULT_CATEGORIES);
+  const promptMap = new Map();
+
+  sets.filter(Boolean).forEach((set) => {
+    (set.categories || []).forEach((category) => {
+      if (category) categories.add(category);
+    });
+    (set.prompts || []).forEach((prompt) => {
+      const current = promptMap.get(prompt.id);
+      if (!current || new Date(prompt.updatedAt) >= new Date(current.updatedAt)) {
+        promptMap.set(prompt.id, normalizePrompt(prompt));
+      }
+    });
+  });
+
+  return {
+    categories: [...categories],
+    prompts: [...promptMap.values()],
+  };
+}
+
+function currentData() {
+  return {
+    categories: state.categories,
+    prompts: state.prompts,
+  };
+}
+
+function loadPrompts() {
+  return readStorageData(STORAGE_KEY);
+}
+
+function savePrompts(data = currentData(), options = {}) {
+  const normalized = normalizeData(data);
+  const next = options.mergeExisting
+    ? mergeDataSets(readStorageData(STORAGE_KEY), normalized)
+    : normalized;
+
+  state.categories = next.categories;
+  state.prompts = next.prompts;
   localStorage.setItem(
     STORAGE_KEY,
     JSON.stringify({
-      categories: state.categories,
-      prompts: state.prompts,
+      categories: next.categories,
+      prompts: next.prompts,
       exportedAt: nowIso(),
     })
   );
+}
+
+function load() {
+  const stableData = readStorageData(STORAGE_KEY);
+  const alreadyMigrated = localStorage.getItem(MIGRATION_KEY) === "true";
+  const shouldReadLegacy = !alreadyMigrated || !stableData;
+  const foundData = [
+    stableData,
+    ...(shouldReadLegacy ? LEGACY_STORAGE_KEYS.map(readStorageData) : []),
+  ].filter(Boolean);
+
+  if (!foundData.length) {
+    state.categories = [...DEFAULT_CATEGORIES];
+    state.prompts = seedPrompts();
+    savePrompts();
+    return;
+  }
+
+  const migrated = mergeDataSets(...foundData);
+  state.categories = migrated.categories;
+  state.prompts = migrated.prompts;
+  savePrompts();
+  localStorage.setItem(MIGRATION_KEY, "true");
+}
+
+function save(options = {}) {
+  savePrompts(currentData(), options);
 }
 
 function seedPrompts() {
@@ -141,27 +218,20 @@ function showToast(message) {
 }
 
 function goBack() {
-  const rawContext = sessionStorage.getItem("promptbox:returnContext");
   const currentId = routeParts()[1];
 
-  if (rawContext) {
-    try {
-      const context = JSON.parse(rawContext);
-      if (context.id === currentId && context.route && context.route !== location.hash) {
-        sessionStorage.removeItem("promptbox:returnContext");
-        location.hash = context.route;
-        return;
-      }
-    } catch {
-      sessionStorage.removeItem("promptbox:returnContext");
-    }
+  if (state.returnContext?.id === currentId && state.returnContext.route) {
+    const route = state.returnContext.route;
+    state.returnContext = null;
+    location.hash = route;
+    return;
   }
 
   location.hash = "#/";
 }
 
 function rememberDetailSource(route, id) {
-  sessionStorage.setItem("promptbox:returnContext", JSON.stringify({ route: route || "#/", id }));
+  state.returnContext = { route: route || "#/", id };
 }
 
 async function copyText(text) {
@@ -468,7 +538,7 @@ function renderPromptList() {
 
 function renderEdit(id) {
   const editing = state.prompts.find((prompt) => prompt.id === id);
-  if (!editing) sessionStorage.removeItem("promptbox:returnContext");
+  if (!editing) state.returnContext = null;
   setTitle(editing ? "编辑 Prompt" : "新建 Prompt");
   const prompt = editing || {
     title: "",
@@ -525,6 +595,11 @@ function renderEdit(id) {
   document.querySelector("#imageInput").addEventListener("change", async (event) => {
     const nextImages = await readImageFiles(event.target.files || []);
     draftImages = [...draftImages, ...nextImages];
+    if (editing) {
+      editing.images = draftImages;
+      editing.updatedAt = nowIso();
+      save({ mergeExisting: true });
+    }
     event.target.value = "";
     renderImagePreviews(draftImages);
   });
@@ -533,6 +608,11 @@ function renderEdit(id) {
     const button = event.target.closest("[data-remove-image]");
     if (!button) return;
     draftImages = draftImages.filter((_, index) => index !== Number(button.dataset.removeImage));
+    if (editing) {
+      editing.images = draftImages;
+      editing.updatedAt = nowIso();
+      save({ mergeExisting: true });
+    }
     renderImagePreviews(draftImages);
   });
 
@@ -557,7 +637,7 @@ function renderEdit(id) {
     if (editing) {
       Object.assign(editing, next);
       showToast("已更新");
-      save();
+      save({ mergeExisting: true });
       location.hash = `#/detail/${editing.id}`;
       return;
     }
@@ -568,7 +648,7 @@ function renderEdit(id) {
       createdAt: nowIso(),
     };
     state.prompts.unshift(created);
-    save();
+    save({ mergeExisting: true });
     showToast("已保存");
     location.hash = `#/detail/${created.id}`;
   });
@@ -626,7 +706,7 @@ function renderDetail(id) {
   document.querySelector("#favoriteBtn").addEventListener("click", () => {
     prompt.favorite = !prompt.favorite;
     prompt.updatedAt = nowIso();
-    save();
+    save({ mergeExisting: true });
     renderDetail(id);
   });
   document.querySelector("#deleteBtn").addEventListener("click", () => {
@@ -728,14 +808,19 @@ function renderSettings() {
       <div class="card card-pad form">
         <h2>数据备份</h2>
         <div class="actions">
-          <button class="button" id="exportBtn">导出 JSON</button>
-          <label class="ghost-button" for="importFile">导入 JSON</label>
+          <button class="button" id="exportBtn">导出数据</button>
+          <label class="ghost-button" for="importFile">导入数据</label>
           <input class="file-input" id="importFile" type="file" accept="application/json,.json" />
         </div>
       </div>
       <div class="card card-pad form">
         <h2>本地数据</h2>
         <p class="muted">当前浏览器内共有 ${state.prompts.length} 条 Prompt，${state.categories.length} 个分类。</p>
+        <div class="storage-debug">
+          <span>当前存储条数：${state.prompts.length}</span>
+          <span>当前 storage key：${STORAGE_KEY}</span>
+        </div>
+        <button class="ghost-button" id="testSaveBtn">测试保存</button>
         <button class="danger-button" id="clearBtn">清空本地数据</button>
       </div>
     </section>
@@ -743,6 +828,26 @@ function renderSettings() {
 
   document.querySelector("#exportBtn").addEventListener("click", exportJson);
   document.querySelector("#importFile").addEventListener("change", importJson);
+  document.querySelector("#testSaveBtn").addEventListener("click", () => {
+    const createdAt = nowIso();
+    state.prompts.unshift(
+      normalizePrompt({
+        id: uid(),
+        title: `测试保存 ${formatDate(createdAt)}`,
+        body: "这是一条用于验证 localStorage 持久化的测试 Prompt。刷新或重新打开页面后，它应该仍然存在。",
+        category: state.categories[0] || "其他",
+        tags: ["测试保存"],
+        note: "可在验证后手动删除。",
+        favorite: false,
+        images: [],
+        createdAt,
+        updatedAt: createdAt,
+      })
+    );
+    save();
+    showToast("测试 Prompt 已保存");
+    renderSettings();
+  });
   document.querySelector("#clearBtn").addEventListener("click", () => {
     if (!confirm("确定清空本地数据吗？")) return;
     state.prompts = [];
@@ -775,7 +880,7 @@ function exportJson() {
   link.download = `promptbox-${new Date().toISOString().slice(0, 10)}.json`;
   link.click();
   URL.revokeObjectURL(url);
-  showToast("JSON 已导出");
+  showToast("数据已导出");
 }
 
 function importJson(event) {
@@ -785,17 +890,19 @@ function importJson(event) {
   reader.onload = () => {
     try {
       const parsed = JSON.parse(reader.result);
-      if (!Array.isArray(parsed.prompts) || !Array.isArray(parsed.categories)) {
+      const imported = normalizeData(parsed);
+      if (!imported.prompts.length) {
         throw new Error("Invalid PromptBox JSON");
       }
-      state.prompts = parsed.prompts.map(normalizePrompt);
-      state.categories = parsed.categories.length ? parsed.categories : [...DEFAULT_CATEGORIES];
+      const merged = mergeDataSets(currentData(), imported);
+      state.prompts = merged.prompts;
+      state.categories = merged.categories;
       if (!state.categories.includes("其他")) state.categories.push("其他");
       state.prompts.forEach((prompt) => {
         if (!state.categories.includes(prompt.category)) prompt.category = "其他";
       });
-      save();
-      showToast("JSON 已导入");
+      save({ mergeExisting: true });
+      showToast("数据已导入");
       renderSettings();
     } catch {
       showToast("导入失败，请检查 JSON 文件");

@@ -731,6 +731,17 @@ button:disabled:hover {
   color: var(--muted);
 }
 
+.storage-debug {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid rgba(139, 185, 255, 0.34);
+  border-radius: var(--radius);
+  background: rgba(234, 242, 255, 0.48);
+  color: #435066;
+  font-size: 13px;
+}
+
 .empty {
   display: grid;
   min-height: 220px;
