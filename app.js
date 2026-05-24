@@ -9,6 +9,10 @@ const state = {
     category: "全部",
     favorite: false,
   },
+  management: {
+    enabled: false,
+    selected: new Set(),
+  },
 };
 
 const app = document.querySelector("#app");
@@ -137,12 +141,27 @@ function showToast(message) {
 }
 
 function goBack() {
-  if (history.length > 1) {
-    history.back();
-    return;
+  const rawContext = sessionStorage.getItem("promptbox:returnContext");
+  const currentId = routeParts()[1];
+
+  if (rawContext) {
+    try {
+      const context = JSON.parse(rawContext);
+      if (context.id === currentId && context.route && context.route !== location.hash) {
+        sessionStorage.removeItem("promptbox:returnContext");
+        location.hash = context.route;
+        return;
+      }
+    } catch {
+      sessionStorage.removeItem("promptbox:returnContext");
+    }
   }
 
   location.hash = "#/";
+}
+
+function rememberDetailSource(route, id) {
+  sessionStorage.setItem("promptbox:returnContext", JSON.stringify({ route: route || "#/", id }));
 }
 
 async function copyText(text) {
@@ -273,11 +292,26 @@ function render() {
   return renderDashboard();
 }
 
-function promptCard(prompt) {
+function promptCard(prompt, options = {}) {
+  const management = Boolean(options.management);
+  const source = options.source || "#/prompts";
+  const selected = state.management.selected.has(prompt.id);
   const tags = (prompt.tags || []).map((tag) => `<span class="tag">#${escapeHtml(tag)}</span>`).join("");
   const cover = prompt.images?.[0];
+  const element = management ? "div" : "a";
+  const attrs = management
+    ? `data-prompt-id="${prompt.id}"`
+    : `href="#/detail/${prompt.id}" onclick="rememberDetailSource('${source}', '${prompt.id}')"`;
+
   return `
-    <a class="prompt-item ${cover ? "has-cover" : ""}" href="#/detail/${prompt.id}">
+    <${element} class="prompt-item ${cover ? "has-cover" : ""} ${management ? "is-managing" : ""}" ${attrs}>
+      ${
+        management
+          ? `<label class="manage-check" aria-label="选择 ${escapeHtml(prompt.title)}">
+              <input type="checkbox" data-manage-checkbox="${prompt.id}" ${selected ? "checked" : ""} />
+            </label>`
+          : ""
+      }
       ${cover ? `<div class="prompt-cover"><img src="${cover}" alt="${escapeHtml(prompt.title)} 封面" /></div>` : ""}
       <div class="prompt-card-main">
         <div class="prompt-head">
@@ -292,7 +326,7 @@ function promptCard(prompt) {
         </div>
         <div class="tag-row">${tags || '<span class="muted">暂无标签</span>'}</div>
       </div>
-    </a>
+    </${element}>
   `;
 }
 
@@ -318,7 +352,7 @@ function renderDashboard() {
           <a class="ghost-button" href="#/prompts">查看全部</a>
         </div>
         <div class="prompt-list">
-          ${list.length ? list.map(promptCard).join("") : empty("还没有 Prompt")}
+          ${list.length ? list.map((prompt) => promptCard(prompt, { source: "#/" })).join("") : empty("还没有 Prompt")}
         </div>
       </section>
       <section class="card card-pad">
@@ -345,7 +379,12 @@ function renderDashboard() {
 
 function renderPromptList() {
   setTitle("Prompt 列表");
+  const existingIds = new Set(state.prompts.map((prompt) => prompt.id));
+  state.management.selected.forEach((id) => {
+    if (!existingIds.has(id)) state.management.selected.delete(id);
+  });
   const items = filteredPrompts();
+  const selectedCount = state.management.selected.size;
   app.innerHTML = `
     <section class="card card-pad">
       <div class="toolbar">
@@ -355,10 +394,21 @@ function renderPromptList() {
           ${state.categories.map((name) => `<option ${state.filters.category === name ? "selected" : ""}>${escapeHtml(name)}</option>`).join("")}
         </select>
         <button class="ghost-button" id="favoriteFilter">${state.filters.favorite ? "全部 Prompt" : "只看收藏"}</button>
+        <button class="ghost-button" id="manageToggle">${state.management.enabled ? "取消管理" : "管理"}</button>
       </div>
+      ${
+        state.management.enabled
+          ? `<div class="bulk-bar">
+              <strong>已选择 ${selectedCount} 项</strong>
+              <button class="ghost-button" id="selectAllBtn">全选</button>
+              <button class="ghost-button" id="clearSelectBtn">取消选择</button>
+              <button class="danger-button" id="deleteSelectedBtn" ${selectedCount ? "" : "disabled"}>删除所选</button>
+            </div>`
+          : ""
+      }
     </section>
     <section class="prompt-list">
-      ${items.length ? items.map(promptCard).join("") : empty("没有匹配的 Prompt")}
+      ${items.length ? items.map((prompt) => promptCard(prompt, { source: "#/prompts", management: state.management.enabled })).join("") : empty("没有匹配的 Prompt")}
     </section>
   `;
 
@@ -374,10 +424,51 @@ function renderPromptList() {
     state.filters.favorite = !state.filters.favorite;
     renderPromptList();
   });
+  document.querySelector("#manageToggle").addEventListener("click", () => {
+    state.management.enabled = !state.management.enabled;
+    state.management.selected.clear();
+    renderPromptList();
+  });
+
+  if (!state.management.enabled) return;
+
+  document.querySelectorAll("[data-manage-checkbox]").forEach((checkbox) => {
+    checkbox.addEventListener("change", (event) => {
+      const id = event.target.dataset.manageCheckbox;
+      if (event.target.checked) {
+        state.management.selected.add(id);
+      } else {
+        state.management.selected.delete(id);
+      }
+      renderPromptList();
+    });
+  });
+
+  document.querySelector("#selectAllBtn").addEventListener("click", () => {
+    items.forEach((prompt) => state.management.selected.add(prompt.id));
+    renderPromptList();
+  });
+
+  document.querySelector("#clearSelectBtn").addEventListener("click", () => {
+    state.management.selected.clear();
+    renderPromptList();
+  });
+
+  document.querySelector("#deleteSelectedBtn").addEventListener("click", () => {
+    if (!state.management.selected.size) return;
+    if (!confirm("确定删除选中的 Prompt 吗？此操作不可恢复。")) return;
+    const selectedIds = new Set(state.management.selected);
+    state.prompts = state.prompts.filter((prompt) => !selectedIds.has(prompt.id));
+    state.management.selected.clear();
+    save();
+    showToast("已删除所选 Prompt");
+    renderPromptList();
+  });
 }
 
 function renderEdit(id) {
   const editing = state.prompts.find((prompt) => prompt.id === id);
+  if (!editing) sessionStorage.removeItem("promptbox:returnContext");
   setTitle(editing ? "编辑 Prompt" : "新建 Prompt");
   const prompt = editing || {
     title: "",
@@ -465,7 +556,7 @@ function renderEdit(id) {
 
     if (editing) {
       Object.assign(editing, next);
-      showToast("已保存修改");
+      showToast("已更新");
       save();
       location.hash = `#/detail/${editing.id}`;
       return;
@@ -478,7 +569,7 @@ function renderEdit(id) {
     };
     state.prompts.unshift(created);
     save();
-    showToast("已创建 Prompt");
+    showToast("已保存");
     location.hash = `#/detail/${created.id}`;
   });
 }

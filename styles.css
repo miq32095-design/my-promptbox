@@ -259,6 +259,18 @@ h3 {
   box-shadow: var(--shadow);
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.54;
+  transform: none;
+  box-shadow: none;
+}
+
+button:disabled:hover {
+  transform: none;
+  box-shadow: none;
+}
+
 .view {
   display: grid;
   gap: 18px;
@@ -325,9 +337,27 @@ h3 {
 
 .toolbar {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 180px 130px;
+  grid-template-columns: minmax(0, 1fr) 180px 130px 104px;
   gap: 10px;
   align-items: center;
+}
+
+.bulk-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid rgba(139, 185, 255, 0.34);
+  border-radius: var(--radius);
+  background: rgba(234, 242, 255, 0.5);
+}
+
+.bulk-bar strong {
+  margin-right: auto;
+  color: #376fc9;
+  font-size: 13px;
 }
 
 .field,
@@ -496,6 +526,38 @@ h3 {
   gap: 14px;
   align-items: stretch;
   padding: 12px;
+}
+
+.prompt-item.is-managing {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  cursor: default;
+}
+
+.prompt-item.has-cover.is-managing {
+  grid-template-columns: auto 132px minmax(0, 1fr);
+}
+
+.prompt-item.is-managing:hover {
+  border-color: rgba(139, 185, 255, 0.48);
+  box-shadow: 0 10px 22px rgba(79, 141, 247, 0.08);
+}
+
+.manage-check {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border: 1px solid rgba(139, 185, 255, 0.44);
+  border-radius: 10px;
+  background: #f8fbff;
+}
+
+.manage-check input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--blue-strong);
+  cursor: pointer;
 }
 
 .prompt-cover {
@@ -864,6 +926,25 @@ h3 {
 
   .prompt-item.has-cover {
     grid-template-columns: 104px minmax(0, 1fr);
+  }
+
+  .prompt-item.is-managing,
+  .prompt-item.has-cover.is-managing {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .prompt-item.has-cover.is-managing .prompt-cover {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+
+  .bulk-bar .ghost-button,
+  .bulk-bar .danger-button {
+    flex: 1 1 118px;
+  }
+
+  .bulk-bar strong {
+    flex: 1 1 100%;
   }
 
   .image-preview-list {
