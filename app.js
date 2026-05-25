@@ -50,6 +50,14 @@ function escapeHtml(value = "") {
     .replaceAll("'", "&#039;");
 }
 
+function renderFormattedPromptBody(value = "") {
+  return escapeHtml(value)
+    .replace(/\[large\]([\s\S]*?)\[\/large\]/g, (_, text) => `<span class="text-large">${text}</span>`)
+    .replace(/\[small\]([\s\S]*?)\[\/small\]/g, (_, text) => `<span class="text-small">${text}</span>`)
+    .replace(/\*\*([\s\S]*?)\*\*/g, (_, text) => `<strong>${text}</strong>`)
+    .replace(/==([\s\S]*?)==/g, (_, text) => `<span class="text-highlight">${text}</span>`);
+}
+
 function icon(name) {
   const paths = {
     plus: '<path d="M12 5v14M5 12h14"/>',
@@ -418,6 +426,70 @@ function renderImagePreviews(images) {
         )
         .join("")
     : '<p class="image-empty">第一张图片会作为封面图</p>';
+}
+
+function flashFormatControl(control) {
+  if (!control) return;
+  control.classList.add("is-active");
+  setTimeout(() => control.classList.remove("is-active"), 360);
+}
+
+function wrapTextareaSelection(textarea, prefix, suffix, placeholder) {
+  const start = textarea.selectionStart;
+  const end = textarea.selectionEnd;
+  const selectedText = textarea.value.slice(start, end);
+  const innerText = selectedText || placeholder;
+  const nextText = `${prefix}${innerText}${suffix}`;
+
+  textarea.setRangeText(nextText, start, end, "end");
+  textarea.focus();
+
+  const innerStart = start + prefix.length;
+  const innerEnd = innerStart + innerText.length;
+  textarea.setSelectionRange(innerStart, innerEnd);
+}
+
+function setTextareaFontSize(textarea, size) {
+  const start = textarea.selectionStart;
+  const end = textarea.selectionEnd;
+  const selectedText = textarea.value.slice(start, end);
+  const cleanText = selectedText.replace(/^\[(small|large)\]([\s\S]*?)\[\/\1\]$/i, "$2");
+
+  if (size === "default") {
+    if (!selectedText) return;
+    textarea.setRangeText(cleanText, start, end, "end");
+    textarea.focus();
+    textarea.setSelectionRange(start, start + cleanText.length);
+    return;
+  }
+
+  const placeholder = size === "small" ? "小字号文字" : "大字号文字";
+  const innerText = cleanText || placeholder;
+  const prefix = `[${size}]`;
+  const suffix = `[/${size}]`;
+
+  textarea.setRangeText(`${prefix}${innerText}${suffix}`, start, end, "end");
+  textarea.focus();
+  textarea.setSelectionRange(start + prefix.length, start + prefix.length + innerText.length);
+}
+
+function bindPromptFormatToolbar() {
+  const toolbar = document.querySelector("#formatToolbar");
+  const textarea = document.querySelector('textarea[name="body"]');
+  if (!toolbar || !textarea) return;
+
+  toolbar.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-format]");
+    if (!button) return;
+
+    const format = button.dataset.format;
+    if (format === "bold") wrapTextareaSelection(textarea, "**", "**", "加粗文字");
+    if (format === "highlight") wrapTextareaSelection(textarea, "==", "==", "高亮文字");
+    if (format === "small" || format === "default" || format === "large") {
+      setTextareaFontSize(textarea, format);
+    }
+    flashFormatControl(button);
+  });
 }
 
 function detailImageGallery(images = []) {
@@ -849,6 +921,15 @@ function renderEdit(id) {
         <input class="field" name="title" required maxlength="80" value="${escapeHtml(prompt.title)}" />
       </label>
       <label class="label">正文
+        <div class="format-toolbar" id="formatToolbar" aria-label="正文格式工具栏">
+          <button class="format-button format-bold" type="button" data-format="bold" title="加粗">B</button>
+          <button class="format-button" type="button" data-format="highlight" title="高亮">高亮</button>
+          <span class="format-divider"></span>
+          <span class="format-label">字号</span>
+          <button class="format-button" type="button" data-format="small">小</button>
+          <button class="format-button" type="button" data-format="default">默认</button>
+          <button class="format-button" type="button" data-format="large">大</button>
+        </div>
         <textarea class="textarea" name="body" required>${escapeHtml(prompt.body)}</textarea>
       </label>
       <section class="label image-field">上传图片
@@ -883,6 +964,7 @@ function renderEdit(id) {
   `;
 
   renderImagePreviews(draftImages);
+  bindPromptFormatToolbar();
 
   document.querySelector("#imageInput").addEventListener("change", async (event) => {
     const nextImages = await readImageFiles(event.target.files || []);
@@ -980,7 +1062,7 @@ function renderDetail(id) {
         <span class="favorite-state ${prompt.favorite ? "is-active" : ""}">${prompt.favorite ? "已收藏" : "未收藏"}</span>
       </div>
       <div class="tag-row">${(prompt.tags || []).map((tag) => `<span class="tag">#${escapeHtml(tag)}</span>`).join("")}</div>
-      <div class="detail-body">${escapeHtml(prompt.body)}</div>
+      <div class="detail-body">${renderFormattedPromptBody(prompt.body)}</div>
       ${prompt.note ? `<div class="detail-note"><h3>备注</h3><div class="note-box">${escapeHtml(prompt.note)}</div></div>` : ""}
       <div class="actions">
         <a class="button" href="#/edit/${prompt.id}">${icon("pencil")}编辑</a>
