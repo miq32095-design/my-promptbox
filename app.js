@@ -31,6 +31,7 @@ const pageKicker = document.querySelector("#pageKicker");
 const toast = document.querySelector("#toast");
 let dbPromise;
 let saveQueue = Promise.resolve();
+let detailPreviewKeyHandler = null;
 
 function uid() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
@@ -427,7 +428,7 @@ function detailImageGallery(images = []) {
       ${images
         .map(
           (src, index) => `
-            <figure class="detail-image">
+            <figure class="detail-image" data-detail-image="${index}">
               <img src="${src}" alt="Prompt 图片 ${index + 1}" />
             </figure>
           `
@@ -435,6 +436,74 @@ function detailImageGallery(images = []) {
         .join("")}
     </div>
   `;
+}
+
+function closeDetailImagePreview() {
+  const modal = document.querySelector(".detail-preview-modal");
+  if (modal) modal.remove();
+  document.body.classList.remove("is-preview-open");
+  if (detailPreviewKeyHandler) {
+    document.removeEventListener("keydown", detailPreviewKeyHandler);
+    detailPreviewKeyHandler = null;
+  }
+}
+
+function openDetailImagePreview(images = [], startIndex = 0) {
+  if (!images.length) return;
+
+  closeDetailImagePreview();
+
+  let currentIndex = Math.min(Math.max(startIndex, 0), images.length - 1);
+  const hasMultiple = images.length > 1;
+  const modal = document.createElement("div");
+  modal.className = "detail-preview-modal";
+  modal.innerHTML = `
+    <button class="detail-preview-close" type="button" data-preview-close aria-label="Close image preview">×</button>
+    ${
+      hasMultiple
+        ? `<button class="detail-preview-nav detail-preview-prev" type="button" data-preview-prev aria-label="Previous image">‹</button>
+           <button class="detail-preview-nav detail-preview-next" type="button" data-preview-next aria-label="Next image">›</button>`
+        : ""
+    }
+    <img class="detail-preview-image" alt="Prompt preview image" />
+    ${hasMultiple ? '<div class="detail-preview-count"></div>' : ""}
+  `;
+
+  const image = modal.querySelector(".detail-preview-image");
+  const count = modal.querySelector(".detail-preview-count");
+
+  const updatePreview = () => {
+    image.src = images[currentIndex];
+    image.alt = `Prompt preview image ${currentIndex + 1}`;
+    if (count) count.textContent = `${currentIndex + 1} / ${images.length}`;
+  };
+
+  const showSibling = (offset) => {
+    currentIndex = (currentIndex + offset + images.length) % images.length;
+    updatePreview();
+  };
+
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal || event.target.closest("[data-preview-close]")) {
+      closeDetailImagePreview();
+      return;
+    }
+
+    if (event.target.closest("[data-preview-prev]")) showSibling(-1);
+    if (event.target.closest("[data-preview-next]")) showSibling(1);
+  });
+
+  detailPreviewKeyHandler = (event) => {
+    if (event.key === "Escape") closeDetailImagePreview();
+    if (!hasMultiple) return;
+    if (event.key === "ArrowLeft") showSibling(-1);
+    if (event.key === "ArrowRight") showSibling(1);
+  };
+
+  document.addEventListener("keydown", detailPreviewKeyHandler);
+  document.body.appendChild(modal);
+  document.body.classList.add("is-preview-open");
+  updatePreview();
 }
 
 function canvasToDataUrl(canvas) {
@@ -529,6 +598,7 @@ function categoryCounts() {
 }
 
 function render() {
+  closeDetailImagePreview();
   updateActiveNav();
   const parts = routeParts();
   const route = parts[0] || "";
@@ -920,6 +990,11 @@ function renderDetail(id) {
   `;
 
   document.querySelector("#backBtn").addEventListener("click", goBack);
+  document.querySelector(".detail-gallery")?.addEventListener("click", (event) => {
+    const item = event.target.closest("[data-detail-image]");
+    if (!item) return;
+    openDetailImagePreview(prompt.images || [], Number(item.dataset.detailImage) || 0);
+  });
   document.querySelector("#copyBtn").addEventListener("click", async () => {
     const button = document.querySelector("#copyBtn");
     await copyText(prompt.body);
