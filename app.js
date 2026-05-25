@@ -1,4 +1,5 @@
 const STORAGE_KEY = "promptbox_prompts";
+const TODO_STORAGE_KEY = "promptbox_todos";
 const LEGACY_STORAGE_KEYS = ["promptbox:data:v1", "prompts", "promptbox-data", "promptboxData"];
 const DB_NAME = "PromptBoxDB";
 const DB_VERSION = 1;
@@ -23,6 +24,7 @@ const state = {
     selected: new Set(),
   },
   returnContext: null,
+  todos: [],
 };
 
 const app = document.querySelector("#app");
@@ -148,6 +150,50 @@ function normalizePrompt(prompt = {}) {
     createdAt: prompt.createdAt || nowIso(),
     updatedAt: prompt.updatedAt || nowIso(),
   };
+}
+
+function normalizeTodo(todo = {}) {
+  const priorities = ["low", "medium", "high"];
+  return {
+    id: todo.id || `todo_${uid()}`,
+    content: String(todo.content || "").trim(),
+    dueDate: todo.dueDate || "",
+    priority: priorities.includes(todo.priority) ? todo.priority : "low",
+    completed: Boolean(todo.completed),
+    createdAt: todo.createdAt || nowIso(),
+    completedAt: todo.completedAt || null,
+    archived: Boolean(todo.archived),
+  };
+}
+
+function loadTodos() {
+  try {
+    const raw = localStorage.getItem(TODO_STORAGE_KEY);
+    state.todos = raw ? JSON.parse(raw).map(normalizeTodo).filter((todo) => todo.content) : [];
+  } catch (error) {
+    console.error("读取 Todo 数据失败", error);
+    state.todos = [];
+  }
+}
+
+function saveTodos() {
+  localStorage.setItem(TODO_STORAGE_KEY, JSON.stringify(state.todos.map(normalizeTodo)));
+}
+
+function cleanupTodos() {
+  const now = Date.now();
+  const threeDays = 3 * 24 * 60 * 60 * 1000;
+  let changed = false;
+
+  state.todos = state.todos.map((todo) => {
+    if (todo.completed && todo.completedAt && !todo.archived && now - new Date(todo.completedAt).getTime() > threeDays) {
+      changed = true;
+      return { ...todo, archived: true };
+    }
+    return todo;
+  });
+
+  if (changed) saveTodos();
 }
 
 function normalizeData(data = {}) {
@@ -1186,6 +1232,172 @@ function dashboardPromptCard(prompt, index) {
   `;
 }
 
+function todoPriorityLabel(priority) {
+  const labels = { low: "普通", medium: "重要", high: "紧急" };
+  return labels[priority] || labels.low;
+}
+
+function todoPriorityRank(priority) {
+  return { high: 3, medium: 2, low: 1 }[priority] || 1;
+}
+
+function formatTodoDate(value) {
+  if (!value) return "无截止";
+  const date = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return "无截止";
+  return new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit" }).format(date);
+}
+
+function visibleTodos() {
+  return state.todos
+    .filter((todo) => !todo.archived)
+    .sort((a, b) => {
+      if (a.completed !== b.completed) return a.completed ? 1 : -1;
+      const priorityDiff = todoPriorityRank(b.priority) - todoPriorityRank(a.priority);
+      if (priorityDiff) return priorityDiff;
+      const aDue = a.dueDate ? new Date(`${a.dueDate}T00:00:00`).getTime() : Infinity;
+      const bDue = b.dueDate ? new Date(`${b.dueDate}T00:00:00`).getTime() : Infinity;
+      if (aDue !== bDue) return aDue - bDue;
+      return new Date(b.createdAt) - new Date(a.createdAt);
+    });
+}
+
+function completedTodos(limit = 5) {
+  return state.todos
+    .filter((todo) => todo.completed && todo.completedAt)
+    .sort((a, b) => new Date(b.completedAt) - new Date(a.completedAt))
+    .slice(0, limit);
+}
+
+function todoItem(todo) {
+  return `
+    <li class="todo-item ${todo.completed ? "is-completed" : ""}">
+      <button class="todo-check" type="button" data-todo-toggle="${todo.id}" aria-label="切换任务完成状态">
+        <span>${todo.completed ? "✓" : ""}</span>
+      </button>
+      <div class="todo-main">
+        <p>${escapeHtml(todo.content)}</p>
+        <div class="todo-meta">
+          <span>截止 ${escapeHtml(formatTodoDate(todo.dueDate))}</span>
+          <span class="todo-priority priority-${todo.priority}">${todoPriorityLabel(todo.priority)}</span>
+        </div>
+      </div>
+      <button class="todo-delete" type="button" data-todo-delete="${todo.id}" aria-label="删除任务">${icon("trash")}</button>
+    </li>
+  `;
+}
+
+function todoTimelineItem(todo) {
+  return `
+    <li class="todo-timeline-item">
+      <span class="timeline-dot priority-${todo.priority}"></span>
+      <div>
+        <time>${formatDate(todo.completedAt)}</time>
+        <p>${escapeHtml(todo.content)}</p>
+        <div class="todo-meta">
+          <span class="todo-priority priority-${todo.priority}">${todoPriorityLabel(todo.priority)}</span>
+          <span>截止 ${escapeHtml(formatTodoDate(todo.dueDate))}</span>
+        </div>
+      </div>
+    </li>
+  `;
+}
+
+function renderTodoDashboard() {
+  const todos = visibleTodos();
+  const timeline = completedTodos(5);
+
+  return `
+    <section class="card card-pad todo-board">
+      <div class="section-head todo-board-head">
+        <div>
+          <h2>今日待办 Todo List</h2>
+          <p>聚焦你当前最重要的创作任务</p>
+        </div>
+      </div>
+      <div class="todo-layout">
+        <div class="todo-list-panel">
+          <form class="todo-form" id="todoForm">
+            <input class="field todo-input" name="content" maxlength="120" placeholder="输入待办任务..." />
+            <input class="field todo-date" name="dueDate" type="date" />
+            <select class="select todo-priority-select" name="priority">
+              <option value="low">普通</option>
+              <option value="medium">重要</option>
+              <option value="high">紧急</option>
+            </select>
+            <button class="button todo-add" type="submit">${icon("plus")}添加任务</button>
+          </form>
+          <div class="todo-list-scroll">
+            <ul class="todo-list">
+              ${todos.length ? todos.map(todoItem).join("") : '<li class="todo-empty">今天还没有待办任务</li>'}
+            </ul>
+          </div>
+        </div>
+        <aside class="todo-timeline-panel">
+          <h3>完成时间轴</h3>
+          <div class="todo-timeline-scroll">
+            ${
+              timeline.length
+                ? `<ol class="todo-timeline">${timeline.map(todoTimelineItem).join("")}</ol>`
+                : '<div class="todo-timeline-empty">完成任务后，这里会生成时间轴。</div>'
+            }
+          </div>
+        </aside>
+      </div>
+    </section>
+  `;
+}
+
+function bindTodoDashboard() {
+  const form = document.querySelector("#todoForm");
+  const board = document.querySelector(".todo-board");
+  if (!form || !board) return;
+
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const data = new FormData(form);
+    const content = String(data.get("content") || "").trim();
+    if (!content) {
+      showToast("请输入待办任务内容");
+      return;
+    }
+
+    state.todos.unshift(
+      normalizeTodo({
+        content,
+        dueDate: data.get("dueDate"),
+        priority: data.get("priority"),
+        createdAt: nowIso(),
+      })
+    );
+    saveTodos();
+    renderDashboard();
+  });
+
+  board.addEventListener("click", (event) => {
+    const toggle = event.target.closest("[data-todo-toggle]");
+    const deleteButton = event.target.closest("[data-todo-delete]");
+
+    if (toggle) {
+      const todo = state.todos.find((item) => item.id === toggle.dataset.todoToggle);
+      if (!todo) return;
+      todo.completed = !todo.completed;
+      todo.completedAt = todo.completed ? nowIso() : null;
+      todo.archived = false;
+      saveTodos();
+      renderDashboard();
+      return;
+    }
+
+    if (deleteButton) {
+      if (!confirm("确定删除这个任务吗？")) return;
+      state.todos = state.todos.filter((todo) => todo.id !== deleteButton.dataset.todoDelete);
+      saveTodos();
+      renderDashboard();
+    }
+  });
+}
+
 function renderDashboard() {
   setTitle("首页 Dashboard");
   const recent = [...state.prompts].sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))[0];
@@ -1196,6 +1408,7 @@ function renderDashboard() {
   const categoryColors = ["#7EDDD0", "#BFE58D", "#F7D66B", "#FF8D86", "#C7A6F8", "#8CC9FF", "#FF9BB3"];
 
   app.innerHTML = `
+    ${renderTodoDashboard()}
     <div class="grid stats-grid dashboard-stats">
       <article class="card stat stat-mint"><span class="stat-icon">${icon("file")}</span><div><span>Prompt 总数</span><strong>${state.prompts.length}</strong></div></article>
       <article class="card stat stat-green"><span class="stat-icon">${icon("heart")}</span><div><span>收藏数量</span><strong>${favCount}</strong></div></article>
@@ -1251,6 +1464,8 @@ function renderDashboard() {
     </div>
     <p class="made-with-love">❤️ Made with love by PromptBox</p>
   `;
+
+  bindTodoDashboard();
 }
 
 function renderPromptList() {
@@ -1780,6 +1995,8 @@ window.addEventListener("hashchange", render);
 async function init() {
   try {
     await load();
+    loadTodos();
+    cleanupTodos();
     render();
   } catch (error) {
     console.error("初始化数据失败", error);
