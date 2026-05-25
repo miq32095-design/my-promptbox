@@ -106,6 +106,34 @@ function isSupportedImageDataUrl(value) {
   return typeof value === "string" && /^data:image\/(jpeg|png|webp);base64,/i.test(value);
 }
 
+function normalizeMindMap(mindMap = {}) {
+  const nodes = Array.isArray(mindMap.nodes)
+    ? mindMap.nodes
+        .filter((node) => node && node.id)
+        .map((node) => ({
+          id: String(node.id),
+          text: String(node.text || ""),
+          x: Number.isFinite(Number(node.x)) ? Number(node.x) : 100,
+          y: Number.isFinite(Number(node.y)) ? Number(node.y) : 100,
+          locked: node.locked !== false,
+          level: Number.isFinite(Number(node.level)) ? Math.max(1, Number(node.level)) : 1,
+          color: typeof node.color === "string" ? node.color : "",
+        }))
+    : [];
+  const nodeIds = new Set(nodes.map((node) => node.id));
+  const edges = Array.isArray(mindMap.edges)
+    ? mindMap.edges
+        .filter((edge) => edge && edge.id && nodeIds.has(edge.from) && nodeIds.has(edge.to))
+        .map((edge) => ({
+          id: String(edge.id),
+          from: String(edge.from),
+          to: String(edge.to),
+        }))
+    : [];
+
+  return { nodes, edges };
+}
+
 function normalizePrompt(prompt = {}) {
   return {
     id: prompt.id || uid(),
@@ -116,6 +144,7 @@ function normalizePrompt(prompt = {}) {
     note: prompt.note || "",
     favorite: Boolean(prompt.favorite),
     images: Array.isArray(prompt.images) ? prompt.images.filter(isSupportedImageDataUrl) : [],
+    mindMap: normalizeMindMap(prompt.mindMap),
     createdAt: prompt.createdAt || nowIso(),
     updatedAt: prompt.updatedAt || nowIso(),
   };
@@ -490,6 +519,419 @@ function bindPromptFormatToolbar() {
     }
     flashFormatControl(button);
   });
+}
+
+function mindMapLevelClass(node = {}) {
+  return `level-${Math.min(4, Math.max(1, Number(node.level) || 1))}`;
+}
+
+const MIND_MAP_CANVAS_WIDTH = 2400;
+const MIND_MAP_CANVAS_HEIGHT = 1400;
+const MIND_MAP_NODE_WIDTH = 240;
+const MIND_MAP_NODE_HEIGHT = 90;
+
+function mindMapPath(fromNode, toNode) {
+  const startX = fromNode.x + 192;
+  const startY = fromNode.y + 36;
+  const endX = toNode.x;
+  const endY = toNode.y + 36;
+  const distance = Math.max(120, Math.abs(endX - startX));
+  const curve = Math.min(180, distance * 0.55);
+  return `M ${startX} ${startY} C ${startX + curve} ${startY}, ${endX - curve} ${endY}, ${endX} ${endY}`;
+}
+
+function renderMindMapSvg(mindMap) {
+  const nodeMap = new Map(mindMap.nodes.map((node) => [node.id, node]));
+  const paths = mindMap.edges
+    .map((edge) => {
+      const fromNode = nodeMap.get(edge.from);
+      const toNode = nodeMap.get(edge.to);
+      if (!fromNode || !toNode) return "";
+      return `<path class="mind-edge-path" d="${mindMapPath(fromNode, toNode)}" />`;
+    })
+    .join("");
+
+  return `
+    <defs>
+      <linearGradient id="mindEdgeGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+        <stop offset="0%" stop-color="#9bdcc4" />
+        <stop offset="100%" stop-color="#9dc8ff" />
+      </linearGradient>
+    </defs>
+    ${paths}
+  `;
+}
+
+function renderMindMapNodes(mindMap, selectedId, editingId) {
+  return mindMap.nodes
+    .map((node) => {
+      const classes = ["mind-node", mindMapLevelClass(node)];
+      if (node.id === selectedId) classes.push("is-selected");
+      if (node.id === editingId) classes.push("is-editing");
+      const nodeId = escapeHtml(node.id);
+      const content =
+        node.id === editingId
+          ? `<textarea class="mind-node-input" data-mind-input="${nodeId}" rows="2">${escapeHtml(node.text)}</textarea>`
+          : `<div class="mind-node-text">${escapeHtml(node.text || "双击编辑")}</div>`;
+
+      return `
+        <div class="${classes.join(" ")}" data-mind-node="${nodeId}" style="left: ${node.x}px; top: ${node.y}px;">
+          ${content}
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function renderReadonlyMindMap(mindMap = {}) {
+  const safeMap = normalizeMindMap(mindMap);
+  if (!safeMap.nodes.length) return "";
+  const minX = Math.min(...safeMap.nodes.map((node) => node.x));
+  const minY = Math.min(...safeMap.nodes.map((node) => node.y));
+  const scrollX = Math.max(0, minX - 80);
+  const scrollY = Math.max(0, minY - 80);
+
+  return `
+    <section class="mind-map-preview">
+      <div class="mind-map-preview-head">
+        <h3>思维导图预览</h3>
+        <span>${safeMap.nodes.length} 个节点</span>
+      </div>
+      <div class="mind-map-scroll mindmap-viewport mind-map-readonly" data-preview-scroll-x="${scrollX}" data-preview-scroll-y="${scrollY}">
+        <div class="mind-map-canvas mindmap-canvas">
+          <svg class="mind-map-lines" width="${MIND_MAP_CANVAS_WIDTH}" height="${MIND_MAP_CANVAS_HEIGHT}" viewBox="0 0 ${MIND_MAP_CANVAS_WIDTH} ${MIND_MAP_CANVAS_HEIGHT}" aria-hidden="true">
+            ${renderMindMapSvg(safeMap)}
+          </svg>
+          ${renderMindMapNodes(safeMap, null, null)}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function positionReadonlyMindMapPreviews() {
+  document.querySelectorAll(".mind-map-readonly[data-preview-scroll-x]").forEach((viewport) => {
+    viewport.scrollLeft = Number(viewport.dataset.previewScrollX) || 0;
+    viewport.scrollTop = Number(viewport.dataset.previewScrollY) || 0;
+  });
+}
+
+function bindReadonlyMindMapPanning() {
+  document.querySelectorAll(".mind-map-readonly").forEach((viewport) => {
+    let isPanning = false;
+    let startX = 0;
+    let startY = 0;
+    let scrollLeft = 0;
+    let scrollTop = 0;
+
+    const startPan = (event) => {
+      if (event.button !== undefined && event.button !== 0) return;
+      isPanning = true;
+      viewport.classList.add("is-panning");
+      startX = event.pageX - viewport.offsetLeft;
+      startY = event.pageY - viewport.offsetTop;
+      scrollLeft = viewport.scrollLeft;
+      scrollTop = viewport.scrollTop;
+    };
+
+    const movePan = (point, originalEvent = point) => {
+      if (!isPanning) return;
+      originalEvent.preventDefault?.();
+      const currentX = point.pageX - viewport.offsetLeft;
+      const currentY = point.pageY - viewport.offsetTop;
+      viewport.scrollLeft = scrollLeft - (currentX - startX);
+      viewport.scrollTop = scrollTop - (currentY - startY);
+    };
+
+    const stopPan = () => {
+      isPanning = false;
+      viewport.classList.remove("is-panning");
+    };
+
+    viewport.addEventListener("mousedown", startPan);
+    viewport.addEventListener("mousemove", movePan);
+    viewport.addEventListener("mouseup", stopPan);
+    viewport.addEventListener("mouseleave", stopPan);
+    viewport.addEventListener("touchstart", (event) => {
+      const touch = event.touches[0];
+      if (!touch) return;
+      startPan(touch);
+    }, { passive: true });
+    viewport.addEventListener("touchmove", (event) => {
+      const touch = event.touches[0];
+      if (!touch) return;
+      movePan(touch, event);
+    }, { passive: false });
+    viewport.addEventListener("touchend", stopPan);
+    viewport.addEventListener("touchcancel", stopPan);
+  });
+}
+
+function bindMindMapEditor(mindMap) {
+  const canvas = document.querySelector("#mindMapCanvas");
+  const count = document.querySelector("#mindMapCount");
+  const clearButton = document.querySelector("#mindMapClear");
+  if (!canvas || !count || !clearButton) return;
+
+  let selectedId = mindMap.nodes[0]?.id || null;
+  let editingId = null;
+  let editingOriginalText = "";
+  let dragState = null;
+  const viewport = canvas.closest(".mindmap-viewport") || canvas.parentElement;
+
+  const stopMindEvent = (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+  };
+
+  const getNode = (id) => mindMap.nodes.find((node) => node.id === id);
+  const clampX = (value) => Math.max(24, Math.min(MIND_MAP_CANVAS_WIDTH - MIND_MAP_NODE_WIDTH, Math.round(value)));
+  const clampY = (value) => Math.max(24, Math.min(MIND_MAP_CANVAS_HEIGHT - MIND_MAP_NODE_HEIGHT, Math.round(value)));
+  const getCanvasPoint = (event) => {
+    const rect = viewport.getBoundingClientRect();
+    return {
+      x: event.clientX - rect.left + viewport.scrollLeft,
+      y: event.clientY - rect.top + viewport.scrollTop,
+    };
+  };
+
+  const setSelected = (id) => {
+    selectedId = id;
+    canvas.querySelectorAll(".mind-node.is-selected").forEach((item) => item.classList.remove("is-selected"));
+    const nodeElement = [...canvas.querySelectorAll("[data-mind-node]")].find((item) => item.dataset.mindNode === id);
+    if (nodeElement) nodeElement.classList.add("is-selected");
+  };
+
+  const updateLines = () => {
+    const svg = canvas.querySelector(".mind-map-lines");
+    if (svg) svg.innerHTML = renderMindMapSvg(mindMap);
+  };
+
+  const scrollNodeIntoView = (id) => {
+    requestAnimationFrame(() => {
+      const nodeElement = [...canvas.querySelectorAll("[data-mind-node]")].find((item) => item.dataset.mindNode === id);
+      nodeElement?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    });
+  };
+
+  const focusEditingNode = (options = {}) => {
+    requestAnimationFrame(() => {
+      const input = [...canvas.querySelectorAll("[data-mind-input]")].find((item) => item.dataset.mindInput === editingId);
+      if (!input) return;
+      input.focus({ preventScroll: true });
+      input.select();
+      if (options.scroll) scrollNodeIntoView(editingId);
+    });
+  };
+
+  const renderMap = () => {
+    canvas.innerHTML = `
+      <svg class="mind-map-lines" width="${MIND_MAP_CANVAS_WIDTH}" height="${MIND_MAP_CANVAS_HEIGHT}" viewBox="0 0 ${MIND_MAP_CANVAS_WIDTH} ${MIND_MAP_CANVAS_HEIGHT}" aria-hidden="true">
+        ${renderMindMapSvg(mindMap)}
+      </svg>
+      ${renderMindMapNodes(mindMap, selectedId, editingId)}
+      <div class="mind-map-hint">双击创建节点 · Tab 创建子节点 · Enter 编辑 · Delete 删除</div>
+    `;
+    count.textContent = `${mindMap.nodes.length} 个节点`;
+  };
+
+  const startEditing = (id, selectText = true) => {
+    const node = getNode(id);
+    if (!node) return;
+    selectedId = id;
+    editingId = id;
+    editingOriginalText = node.text;
+    renderMap();
+    if (selectText) focusEditingNode();
+  };
+
+  const finishEditing = (options = {}) => {
+    if (!editingId) return selectedId;
+    const node = getNode(editingId);
+    if (node) {
+      node.text = node.text.trim() || "未命名节点";
+      node.locked = options.locked !== false;
+    }
+    selectedId = editingId;
+    editingId = null;
+    editingOriginalText = "";
+    renderMap();
+    return selectedId;
+  };
+
+  const cancelEditing = () => {
+    if (!editingId) return;
+    const node = getNode(editingId);
+    if (node) node.text = editingOriginalText;
+    selectedId = editingId;
+    editingId = null;
+    editingOriginalText = "";
+    renderMap();
+  };
+
+  const createNode = (x, y, options = {}) => {
+    const parent = options.parentId ? getNode(options.parentId) : null;
+    const level = parent ? Math.min(4, (Number(parent.level) || 1) + 1) : 1;
+    const node = {
+      id: `node_${uid()}`,
+      text: options.text || "",
+      x: clampX(x),
+      y: clampY(y),
+      locked: Boolean(options.locked),
+      level,
+      color: "",
+    };
+    mindMap.nodes.push(node);
+    selectedId = node.id;
+    editingId = node.id;
+    editingOriginalText = "";
+    renderMap();
+    focusEditingNode({ scroll: options.scroll });
+    return node;
+  };
+
+  const createChildNode = (parentId) => {
+    const parent = getNode(parentId);
+    if (!parent) return;
+    const siblingCount = mindMap.edges.filter((edge) => edge.from === parentId).length;
+    const child = createNode(parent.x + 260, parent.y + 80 + siblingCount * 86, { parentId, scroll: true });
+    mindMap.edges.push({ id: `edge_${uid()}`, from: parent.id, to: child.id });
+    renderMap();
+    focusEditingNode({ scroll: true });
+  };
+
+  const removeSelectedNode = () => {
+    if (!selectedId) return;
+    mindMap.nodes = mindMap.nodes.filter((node) => node.id !== selectedId);
+    mindMap.edges = mindMap.edges.filter((edge) => edge.from !== selectedId && edge.to !== selectedId);
+    selectedId = mindMap.nodes[0]?.id || null;
+    editingId = null;
+    renderMap();
+  };
+
+  canvas.addEventListener("dblclick", (event) => {
+    stopMindEvent(event);
+    const nodeElement = event.target.closest("[data-mind-node]");
+    if (nodeElement) {
+      startEditing(nodeElement.dataset.mindNode);
+      return;
+    }
+
+    const point = getCanvasPoint(event);
+    createNode(point.x, point.y);
+  });
+
+  canvas.addEventListener("click", (event) => {
+    const nodeElement = event.target.closest("[data-mind-node]");
+    if (event.target.closest("[data-mind-input]")) return;
+    stopMindEvent(event);
+    if (!nodeElement) {
+      canvas.focus({ preventScroll: true });
+      return;
+    }
+    editingId = null;
+    renderMap();
+    setSelected(nodeElement.dataset.mindNode);
+    canvas.focus({ preventScroll: true });
+  });
+
+  canvas.addEventListener("input", (event) => {
+    const input = event.target.closest("[data-mind-input]");
+    if (!input) return;
+    const node = getNode(input.dataset.mindInput);
+    if (node) node.text = input.value;
+  });
+
+  canvas.addEventListener("keydown", (event) => {
+    const input = event.target.closest("[data-mind-input]");
+    const editingKeys = ["Tab", "Enter", "Escape", " "];
+    const canvasKeys = ["Tab", "Enter", "Delete", "Backspace"];
+    if (input && editingKeys.includes(event.key)) {
+      stopMindEvent(event);
+      if (event.key === "Escape") {
+        cancelEditing();
+        canvas.focus({ preventScroll: true });
+        return;
+      }
+      if (event.key === "Tab") {
+        const parentId = finishEditing({ locked: false });
+        createChildNode(parentId);
+        return;
+      }
+      finishEditing({ locked: event.key === " " });
+      canvas.focus({ preventScroll: true });
+      return;
+    }
+
+    if (!input && canvasKeys.includes(event.key)) {
+      stopMindEvent(event);
+      if (!selectedId) return;
+      if (event.key === "Tab") createChildNode(selectedId);
+      if (event.key === "Enter") startEditing(selectedId);
+      if (event.key === "Delete" || event.key === "Backspace") removeSelectedNode();
+    }
+  });
+
+  canvas.addEventListener("pointerdown", (event) => {
+    if (event.target.closest("[data-mind-input]")) return;
+    const nodeElement = event.target.closest("[data-mind-node]");
+    if (!nodeElement) return;
+    stopMindEvent(event);
+    const node = getNode(nodeElement.dataset.mindNode);
+    if (!node) return;
+    selectedId = node.id;
+    editingId = null;
+    setSelected(node.id);
+    canvas.focus({ preventScroll: true });
+    dragState = {
+      id: node.id,
+      element: nodeElement,
+      startX: event.clientX,
+      startY: event.clientY,
+      offsetX: getCanvasPoint(event).x - node.x,
+      offsetY: getCanvasPoint(event).y - node.y,
+      moved: false,
+    };
+    nodeElement.classList.add("is-dragging");
+    nodeElement.setPointerCapture?.(event.pointerId);
+  });
+
+  canvas.addEventListener("pointermove", (event) => {
+    if (!dragState) return;
+    stopMindEvent(event);
+    const node = getNode(dragState.id);
+    if (!node) return;
+    if (Math.abs(event.clientX - dragState.startX) > 2 || Math.abs(event.clientY - dragState.startY) > 2) {
+      dragState.moved = true;
+    }
+    const point = getCanvasPoint(event);
+    node.x = clampX(point.x - dragState.offsetX);
+    node.y = clampY(point.y - dragState.offsetY);
+    dragState.element.style.left = `${node.x}px`;
+    dragState.element.style.top = `${node.y}px`;
+    updateLines();
+  });
+
+  const endDrag = (event) => {
+    if (!dragState) return;
+    stopMindEvent(event);
+    dragState.element.classList.remove("is-dragging");
+    dragState = null;
+  };
+
+  canvas.addEventListener("pointerup", endDrag);
+  canvas.addEventListener("pointercancel", endDrag);
+
+  clearButton.addEventListener("click", (event) => {
+    stopMindEvent(event);
+    mindMap.nodes = [];
+    mindMap.edges = [];
+    selectedId = null;
+    editingId = null;
+    renderMap();
+  });
+
+  renderMap();
 }
 
 function detailImageGallery(images = []) {
@@ -912,8 +1354,10 @@ function renderEdit(id) {
     note: "",
     favorite: false,
     images: [],
+    mindMap: { nodes: [], edges: [] },
   };
   let draftImages = [...(prompt.images || [])];
+  const draftMindMap = normalizeMindMap(prompt.mindMap);
 
   app.innerHTML = `
     <form class="card card-pad form" id="promptForm">
@@ -932,6 +1376,21 @@ function renderEdit(id) {
         </div>
         <textarea class="textarea" name="body" required>${escapeHtml(prompt.body)}</textarea>
       </label>
+      <section class="mind-map-panel">
+        <div class="mind-map-head">
+          <div>
+            <h3>思维导图</h3>
+            <p>双击空白处创建节点，输入文字后按空格锁定，按 Tab 创建子节点。</p>
+          </div>
+          <div class="mind-map-tools">
+            <span id="mindMapCount">0 个节点</span>
+            <button class="ghost-button" id="mindMapClear" type="button">清空导图</button>
+          </div>
+        </div>
+        <div class="mind-map-scroll mindmap-viewport">
+          <div class="mind-map-canvas mindmap-canvas" id="mindMapCanvas" tabindex="0" aria-label="思维导图画布"></div>
+        </div>
+      </section>
       <section class="label image-field">上传图片
         <label class="image-upload-card" for="imageInput">
           <span>+ 添加图片</span>
@@ -965,6 +1424,7 @@ function renderEdit(id) {
 
   renderImagePreviews(draftImages);
   bindPromptFormatToolbar();
+  bindMindMapEditor(draftMindMap);
 
   document.querySelector("#imageInput").addEventListener("change", async (event) => {
     const nextImages = await readImageFiles(event.target.files || []);
@@ -1011,6 +1471,7 @@ function renderEdit(id) {
       note: form.get("note").trim(),
       favorite: form.get("favorite") === "on",
       images: draftImages,
+      mindMap: normalizeMindMap(draftMindMap),
       updatedAt: nowIso(),
     };
 
@@ -1062,7 +1523,10 @@ function renderDetail(id) {
         <span class="favorite-state ${prompt.favorite ? "is-active" : ""}">${prompt.favorite ? "已收藏" : "未收藏"}</span>
       </div>
       <div class="tag-row">${(prompt.tags || []).map((tag) => `<span class="tag">#${escapeHtml(tag)}</span>`).join("")}</div>
-      <div class="detail-body">${renderFormattedPromptBody(prompt.body)}</div>
+      <div class="detail-content-stack">
+        <section class="detail-reading-card detail-body">${renderFormattedPromptBody(prompt.body)}</section>
+        ${renderReadonlyMindMap(prompt.mindMap)}
+      </div>
       ${prompt.note ? `<div class="detail-note"><h3>备注</h3><div class="note-box">${escapeHtml(prompt.note)}</div></div>` : ""}
       <div class="actions">
         <a class="button" href="#/edit/${prompt.id}">${icon("pencil")}编辑</a>
@@ -1071,6 +1535,8 @@ function renderDetail(id) {
     </article>
   `;
 
+  positionReadonlyMindMapPreviews();
+  bindReadonlyMindMapPanning();
   document.querySelector("#backBtn").addEventListener("click", goBack);
   document.querySelector(".detail-gallery")?.addEventListener("click", (event) => {
     const item = event.target.closest("[data-detail-image]");
