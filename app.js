@@ -2,11 +2,11 @@ const STORAGE_KEY = "promptbox_prompts";
 const TODO_STORAGE_KEY = "promptbox_todos";
 const LOGIN_STORAGE_KEY = "promptbox_private_access_granted";
 const PRIVATE_ACCESS_CODE = "0725";
-const SUPABASE_URL = "https://kgzyxocfqnhyonvdkzyp.supabase.co";
-const SUPABASE_ANON_KEY = "sb_publishable_oILIc_FJ6so9OyB54LPe7A_4X2PHd1p";
-const SUPABASE_PROMPTS_TABLE = "prompts";
-const SUPABASE_TODOS_TABLE = "todos";
-const SUPABASE_PROMPTS_META_ID = "__promptbox_meta__";
+const CLOUDBASE_ENV_ID = "请在这里填你的 CloudBase 环境 ID";
+const CLOUDBASE_REGION = "";
+const CLOUD_PROMPTS_COLLECTION = "prompts";
+const CLOUD_TODOS_COLLECTION = "todos";
+const CLOUD_PROMPTS_META_ID = "__promptbox_meta__";
 const LEGACY_STORAGE_KEYS = ["promptbox:data:v1", "prompts", "promptbox-data", "promptboxData"];
 const DB_NAME = "PromptBoxDB";
 const DB_VERSION = 1;
@@ -23,7 +23,7 @@ const state = {
   categories: [],
   filters: {
     query: "",
-    category: "鍏ㄩ儴",
+    category: "全部",
     favorite: false,
   },
   management: {
@@ -47,10 +47,10 @@ let dbPromise;
 let saveQueue = Promise.resolve();
 let todoSaveQueue = Promise.resolve();
 let detailPreviewKeyHandler = null;
-let supabaseClient = null;
-let supabaseReady = false;
-let syncWarningShown = false;
-let syncStatus = "未连接";
+let cloudApp = null;
+let cloudDb = null;
+let cloudReady = false;
+let cloudWarningShown = false;
 
 function uid() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
@@ -156,9 +156,9 @@ function normalizeMindMap(mindMap = {}) {
 function normalizePrompt(prompt = {}) {
   return {
     id: prompt.id || uid(),
-    title: prompt.title || "鏈懡鍚?Prompt",
+    title: prompt.title || "未命名 Prompt",
     body: prompt.body || "",
-    category: prompt.category || "鍏朵粬",
+    category: prompt.category || "其他",
     tags: Array.isArray(prompt.tags) ? prompt.tags : [],
     note: prompt.note || "",
     favorite: Boolean(prompt.favorite),
@@ -183,167 +183,154 @@ function normalizeTodo(todo = {}) {
   };
 }
 
-function isSupabaseConfigured() {
+function isCloudConfigured() {
   return Boolean(
-    window.supabase &&
-      SUPABASE_URL &&
-      SUPABASE_ANON_KEY &&
-      SUPABASE_URL.startsWith("https://") &&
-      SUPABASE_ANON_KEY.startsWith("sb_")
+    window.cloudbase &&
+      CLOUDBASE_ENV_ID &&
+      !CLOUDBASE_ENV_ID.includes("请在这里填")
   );
 }
 
-function initSupabase() {
-  if (supabaseClient || supabaseReady) return supabaseReady;
-  if (!isSupabaseConfigured()) {
-    syncStatus = "未配置";
-    console.error("Supabase 未配置或 SDK 未加载", {
-      hasSdk: Boolean(window.supabase),
-      hasUrl: Boolean(SUPABASE_URL),
-      hasKey: Boolean(SUPABASE_ANON_KEY),
-    });
-    showSyncUnavailable();
-    return false;
-  }
+async function initCloudBase() {
+  if (cloudDb || cloudReady) return cloudReady;
+  if (!isCloudConfigured()) return false;
 
   try {
-    supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-    supabaseReady = true;
-    syncStatus = "已连接";
+    cloudApp = window.cloudbase.init({
+      env: CLOUDBASE_ENV_ID,
+      region: CLOUDBASE_REGION || undefined,
+    });
+    const auth = cloudApp.auth({ persistence: "local" });
+    const loginState = await auth.getLoginState();
+    if (!loginState) {
+      await auth.anonymousAuthProvider().signIn();
+    }
+    cloudDb = cloudApp.database();
+    cloudReady = true;
     return true;
   } catch (error) {
-    console.error("Supabase 初始化失败", error);
-    supabaseReady = false;
-    syncStatus = "连接失败";
-    showSyncUnavailable();
+    console.error("CloudBase 初始化失败", error);
+    cloudReady = false;
+    showCloudUnavailable();
     return false;
   }
 }
 
-function showSyncUnavailable() {
-  if (syncWarningShown) return;
-  syncWarningShown = true;
-  showToast("云同步失败");
+function showCloudUnavailable() {
+  if (cloudWarningShown) return;
+  cloudWarningShown = true;
+  showToast("云同步暂不可用，当前显示本地缓存");
 }
 
-function supabaseTable(name) {
-  return initSupabase() && supabaseClient ? supabaseClient.from(name) : null;
+async function getCloudCollection(name) {
+  const ready = await initCloudBase();
+  return ready && cloudDb ? cloudDb.collection(name) : null;
 }
 
-function rowPayload(row = {}) {
-  return row.data && typeof row.data === "object" ? row.data : row;
-}
-
-async function readSupabaseRows(name, normalizer) {
-  const table = supabaseTable(name);
-  if (!table) return null;
+async function readCloudCollection(name, normalizer) {
+  const collection = await getCloudCollection(name);
+  if (!collection) return null;
 
   try {
-    const { data, error } = await table.select("*").limit(1000);
-    if (error) throw error;
-    syncStatus = "已连接";
-    return (data || []).map((row) => normalizer(rowPayload(row)));
+    const result = await collection.limit(1000).get();
+    return (result.data || []).map((item) => normalizer(item));
   } catch (error) {
-    console.error(`读取 Supabase 表 ${name} 失败`, error);
-    syncStatus = "读取失败";
-    showSyncUnavailable();
+    console.error(`读取 CloudBase 集合 ${name} 失败`, error);
+    showCloudUnavailable();
     return null;
   }
 }
 
-async function readSupabasePromptData() {
-  const table = supabaseTable(SUPABASE_PROMPTS_TABLE);
-  if (!table) return null;
+async function readCloudPromptData() {
+  const collection = await getCloudCollection(CLOUD_PROMPTS_COLLECTION);
+  if (!collection) return null;
 
   try {
-    const { data, error } = await table.select("*").limit(1000);
-    if (error) throw error;
-    const docs = data || [];
-    const metaRow = docs.find((row) => row.id === SUPABASE_PROMPTS_META_ID);
-    const meta = rowPayload(metaRow || {});
-    const prompts = docs
-      .filter((row) => row.id !== SUPABASE_PROMPTS_META_ID)
-      .map((row) => normalizePrompt(rowPayload(row)));
-    syncStatus = "已连接";
-    return normalizeData({ categories: meta.categories || [], prompts });
+    const result = await collection.limit(1000).get();
+    const docs = result.data || [];
+    const meta = docs.find((item) => item.id === CLOUD_PROMPTS_META_ID);
+    const prompts = docs.filter((item) => item.id !== CLOUD_PROMPTS_META_ID).map(normalizePrompt);
+    return normalizeData({ categories: meta?.categories || [], prompts });
   } catch (error) {
-    console.error("读取 Supabase Prompt 数据失败", error);
-    syncStatus = "读取失败";
-    showSyncUnavailable();
+    console.error("读取 CloudBase Prompt 数据失败", error);
+    showCloudUnavailable();
     return null;
   }
 }
 
-async function syncSupabaseRows(name, items, normalizer) {
-  const table = supabaseTable(name);
-  if (!table) return false;
+async function syncCloudCollection(name, items, normalizer) {
+  const collection = await getCloudCollection(name);
+  if (!collection) return false;
 
   try {
     const normalizedItems = items.map(normalizer);
-    const { data: existingRows, error: readError } = await table.select("id").limit(1000);
-    if (readError) throw readError;
+    const cloudItems = (await collection.limit(1000).get()).data || [];
+    const cloudById = new Map(cloudItems.filter((item) => item.id).map((item) => [item.id, item]));
     const nextIds = new Set(normalizedItems.map((item) => item.id));
-    const staleIds = (existingRows || []).map((row) => row.id).filter((id) => id && !nextIds.has(id));
 
-    await Promise.all(staleIds.map((id) => table.delete().eq("id", id)));
-    if (normalizedItems.length) {
-      const rows = normalizedItems.map((item) => ({ id: item.id, data: item, updated_at: nowIso() }));
-      const { error } = await table.upsert(rows, { onConflict: "id" });
-      if (error) throw error;
-    }
+    await Promise.all(
+      cloudItems
+        .filter((item) => item.id && !nextIds.has(item.id))
+        .map((item) => collection.doc(item._id).remove())
+    );
 
-    syncStatus = `已同步 ${formatDate(nowIso())}`;
+    await Promise.all(
+      normalizedItems.map((item) => {
+        const existing = cloudById.get(item.id);
+        if (existing?._id) {
+          return collection.doc(existing._id).update(item);
+        }
+        return collection.add(item);
+      })
+    );
+
     showToast("已同步");
     return true;
   } catch (error) {
-    console.error(`同步 Supabase 表 ${name} 失败`, error);
-    syncStatus = "同步失败";
-    showSyncUnavailable();
+    console.error(`同步 CloudBase 集合 ${name} 失败`, error);
+    showCloudUnavailable();
     return false;
   }
 }
 
-async function syncSupabasePrompts(data) {
-  const table = supabaseTable(SUPABASE_PROMPTS_TABLE);
-  if (!table) return false;
+async function syncCloudPrompts(data) {
+  const collection = await getCloudCollection(CLOUD_PROMPTS_COLLECTION);
+  if (!collection) return false;
 
   try {
     const normalized = normalizeData(data);
-    const { data: existingRows, error: readError } = await table.select("id").limit(1000);
-    if (readError) throw readError;
+    const cloudItems = (await collection.limit(1000).get()).data || [];
+    const cloudById = new Map(cloudItems.filter((item) => item.id).map((item) => [item.id, item]));
     const promptIds = new Set(normalized.prompts.map((prompt) => prompt.id));
-    const staleIds = (existingRows || [])
-      .map((row) => row.id)
-      .filter((id) => id && id !== SUPABASE_PROMPTS_META_ID && !promptIds.has(id));
 
-    await Promise.all(staleIds.map((id) => table.delete().eq("id", id)));
+    await Promise.all(
+      cloudItems
+        .filter((item) => item.id && item.id !== CLOUD_PROMPTS_META_ID && !promptIds.has(item.id))
+        .map((item) => collection.doc(item._id).remove())
+    );
 
-    const rows = normalized.prompts.map((prompt) => ({ id: prompt.id, data: prompt, updated_at: nowIso() }));
-    rows.push({
-      id: SUPABASE_PROMPTS_META_ID,
-      data: { id: SUPABASE_PROMPTS_META_ID, type: "meta", categories: normalized.categories, updatedAt: nowIso() },
-      updated_at: nowIso(),
-    });
+    await Promise.all(
+      normalized.prompts.map((prompt) => {
+        const existing = cloudById.get(prompt.id);
+        return existing?._id ? collection.doc(existing._id).update(prompt) : collection.add(prompt);
+      })
+    );
 
-    const { error } = await table.upsert(rows, { onConflict: "id" });
-    if (error) throw error;
+    const meta = { id: CLOUD_PROMPTS_META_ID, type: "meta", categories: normalized.categories, updatedAt: nowIso() };
+    const existingMeta = cloudById.get(CLOUD_PROMPTS_META_ID);
+    if (existingMeta?._id) {
+      await collection.doc(existingMeta._id).update(meta);
+    } else {
+      await collection.add(meta);
+    }
 
-    syncStatus = `已同步 ${formatDate(nowIso())}`;
     showToast("已同步");
     return true;
   } catch (error) {
-    console.error("同步 Supabase Prompt 数据失败", error);
-    syncStatus = "同步失败";
-    showSyncUnavailable();
+    console.error("同步 CloudBase Prompt 数据失败", error);
+    showCloudUnavailable();
     return false;
   }
-}
-
-async function manualSync() {
-  const promptsSynced = await syncSupabasePrompts(currentData());
-  const todosSynced = await syncSupabaseRows(SUPABASE_TODOS_TABLE, state.todos, normalizeTodo);
-  if (!promptsSynced && !todosSynced) showSyncUnavailable();
-  renderSettings();
 }
 
 function isLoggedIn() {
@@ -368,9 +355,9 @@ function logoutPrivateAccess() {
 
 async function loadTodos() {
   try {
-    const supabaseTodos = await readSupabaseRows(SUPABASE_TODOS_TABLE, normalizeTodo);
-    if (supabaseTodos) {
-      state.todos = supabaseTodos.filter((todo) => todo.content);
+    const cloudTodos = await readCloudCollection(CLOUD_TODOS_COLLECTION, normalizeTodo);
+    if (cloudTodos) {
+      state.todos = cloudTodos.filter((todo) => todo.content);
       localStorage.setItem(TODO_STORAGE_KEY, JSON.stringify(state.todos.map(normalizeTodo)));
       return;
     }
@@ -378,7 +365,7 @@ async function loadTodos() {
     const raw = localStorage.getItem(TODO_STORAGE_KEY);
     state.todos = raw ? JSON.parse(raw).map(normalizeTodo).filter((todo) => todo.content) : [];
   } catch (error) {
-    console.error("璇诲彇 Todo 鏁版嵁澶辫触", error);
+    console.error("读取 Todo 数据失败", error);
     state.todos = [];
   }
 }
@@ -387,10 +374,10 @@ function saveTodos() {
   const snapshot = state.todos.map(normalizeTodo);
   localStorage.setItem(TODO_STORAGE_KEY, JSON.stringify(snapshot));
   todoSaveQueue = todoSaveQueue
-    .then(() => syncSupabaseRows(SUPABASE_TODOS_TABLE, snapshot, normalizeTodo))
+    .then(() => syncCloudCollection(CLOUD_TODOS_COLLECTION, snapshot, normalizeTodo))
     .catch((error) => {
-      console.error("淇濆瓨 Todo 鏁版嵁澶辫触", error);
-      showSyncUnavailable();
+      console.error("保存 Todo 数据失败", error);
+      showCloudUnavailable();
     });
   return todoSaveQueue;
 }
@@ -434,7 +421,7 @@ function readStorageData(key) {
     if (!raw) return null;
     return normalizeData(JSON.parse(raw));
   } catch (error) {
-    console.error("璇诲彇 Prompt 鏁版嵁澶辫触", error);
+    console.error("读取 Prompt 数据失败", error);
     return null;
   }
 }
@@ -559,10 +546,10 @@ function currentData() {
 }
 
 async function loadPrompts() {
-  const supabaseData = await readSupabasePromptData();
-  if (supabaseData) {
-    const categories = [...DEFAULT_CATEGORIES, ...supabaseData.categories];
-    return normalizeData({ categories, prompts: supabaseData.prompts });
+  const cloudData = await readCloudPromptData();
+  if (cloudData) {
+    const categories = [...DEFAULT_CATEGORIES, ...cloudData.categories];
+    return normalizeData({ categories, prompts: cloudData.prompts });
   }
   return readStorageData(STORAGE_KEY);
 }
@@ -576,7 +563,7 @@ async function savePrompts(data = currentData(), options = {}) {
   localStorage.setItem(STORAGE_KEY, serialized);
   state.categories = next.categories;
   state.prompts = next.prompts;
-  await syncSupabasePrompts(next);
+  await syncCloudPrompts(next);
   return next;
 }
 
@@ -607,8 +594,8 @@ function save(options = {}) {
   saveQueue = saveQueue
     .then(() => savePrompts(snapshot, options))
     .catch((error) => {
-      console.error("淇濆瓨 Prompt 鏁版嵁澶辫触", error);
-      showToast("淇濆瓨澶辫触锛岃绋嶅悗閲嶈瘯");
+      console.error("保存 Prompt 数据失败", error);
+      showToast("保存失败，请稍后重试");
     });
   return saveQueue;
 }
@@ -645,7 +632,7 @@ function seedPrompts() {
 
 function setTitle(title) {
   pageTitle.textContent = title;
-  if (pageKicker) pageKicker.textContent = title === "首页 Dashboard" ? "欢迎回来！" : "Creative Prompt Workspace";
+  if (pageKicker) pageKicker.textContent = title === "首页 Dashboard" ? "欢迎回来！👋" : "Creative Prompt Workspace";
   document.title = "PromptBox";
 }
 
@@ -694,7 +681,7 @@ function readImageFiles(files) {
   const images = [...files].filter((file) => ["image/jpeg", "image/png", "image/webp"].includes(file.type));
 
   if (images.length !== files.length) {
-    showToast("浠呮敮鎸?JPG銆丳NG銆乄EBP 鍥剧墖");
+    showToast("仅支持 JPG、PNG、WEBP 图片");
   }
 
   return Promise.all(images.map(compressImageFile)).then((results) => {
@@ -714,14 +701,14 @@ function renderImagePreviews(images) {
         .map(
           (src, index) => `
             <div class="image-preview">
-              <img src="${src}" alt="Prompt 鍥剧墖 ${index + 1}" />
-              ${index === 0 ? '<span class="cover-badge">灏侀潰</span>' : ""}
-              <button class="image-remove" type="button" data-remove-image="${index}">鍒犻櫎</button>
+              <img src="${src}" alt="Prompt 图片 ${index + 1}" />
+              ${index === 0 ? '<span class="cover-badge">封面</span>' : ""}
+              <button class="image-remove" type="button" data-remove-image="${index}">删除</button>
             </div>
           `
         )
         .join("")
-    : '<p class="image-empty">绗竴寮犲浘鐗囦細浣滀负灏侀潰鍥?/p>';
+    : '<p class="image-empty">第一张图片会作为封面图</p>';
 }
 
 function flashFormatControl(control) {
@@ -779,8 +766,8 @@ function bindPromptFormatToolbar() {
     if (!button) return;
 
     const format = button.dataset.format;
-    if (format === "bold") wrapTextareaSelection(textarea, "**", "**", "鍔犵矖鏂囧瓧");
-    if (format === "highlight") wrapTextareaSelection(textarea, "==", "==", "楂樹寒鏂囧瓧");
+    if (format === "bold") wrapTextareaSelection(textarea, "**", "**", "加粗文字");
+    if (format === "highlight") wrapTextareaSelection(textarea, "==", "==", "高亮文字");
     if (format === "small" || format === "default" || format === "large") {
       setTextareaFontSize(textarea, format);
     }
@@ -839,7 +826,7 @@ function renderMindMapNodes(mindMap, selectedId, editingId) {
       const content =
         node.id === editingId
           ? `<textarea class="mind-node-input" data-mind-input="${nodeId}" rows="2">${escapeHtml(node.text)}</textarea>`
-          : `<div class="mind-node-text">${escapeHtml(node.text || "鍙屽嚮缂栬緫")}</div>`;
+          : `<div class="mind-node-text">${escapeHtml(node.text || "双击编辑")}</div>`;
 
       return `
         <div class="${classes.join(" ")}" data-mind-node="${nodeId}" style="left: ${node.x}px; top: ${node.y}px;">
@@ -861,8 +848,8 @@ function renderReadonlyMindMap(mindMap = {}) {
   return `
     <section class="mind-map-preview">
       <div class="mind-map-preview-head">
-        <h3>鎬濈淮瀵煎浘棰勮</h3>
-        <span>${safeMap.nodes.length} 涓妭鐐?/span>
+        <h3>思维导图预览</h3>
+        <span>${safeMap.nodes.length} 个节点</span>
       </div>
       <div class="mind-map-scroll mindmap-viewport mind-map-readonly" data-preview-scroll-x="${scrollX}" data-preview-scroll-y="${scrollY}">
         <div class="mind-map-canvas mindmap-canvas">
@@ -1210,7 +1197,7 @@ function detailImageGallery(images = []) {
         .map(
           (src, index) => `
             <figure class="detail-image" data-detail-image="${index}">
-              <img src="${src}" alt="Prompt 鍥剧墖 ${index + 1}" />
+              <img src="${src}" alt="Prompt 图片 ${index + 1}" />
             </figure>
           `
         )
@@ -1239,11 +1226,11 @@ function openDetailImagePreview(images = [], startIndex = 0) {
   const modal = document.createElement("div");
   modal.className = "detail-preview-modal";
   modal.innerHTML = `
-    <button class="detail-preview-close" type="button" data-preview-close aria-label="Close image preview">脳</button>
+    <button class="detail-preview-close" type="button" data-preview-close aria-label="Close image preview">×</button>
     ${
       hasMultiple
-        ? `<button class="detail-preview-nav detail-preview-prev" type="button" data-preview-prev aria-label="Previous image">鈥?/button>
-           <button class="detail-preview-nav detail-preview-next" type="button" data-preview-next aria-label="Next image">鈥?/button>`
+        ? `<button class="detail-preview-nav detail-preview-prev" type="button" data-preview-prev aria-label="Previous image">‹</button>
+           <button class="detail-preview-nav detail-preview-next" type="button" data-preview-next aria-label="Next image">›</button>`
         : ""
     }
     <img class="detail-preview-image" alt="Prompt preview image" />
@@ -1325,9 +1312,9 @@ function dataWithDraftImages(editing, draftImages) {
     : [
         ...state.prompts,
         normalizePrompt({
-          title: "鍥剧墖涓婁紶棰勪及",
+          title: "图片上传预估",
           body: "",
-          category: state.categories[0] || "鍏朵粬",
+          category: state.categories[0] || "其他",
           images: draftImages,
         }),
       ];
@@ -1362,7 +1349,7 @@ function filteredPrompts(limit) {
       const text = [prompt.title, prompt.body, ...(prompt.tags || [])].join(" ").toLowerCase();
       const matchQuery = !q || text.includes(q);
       const matchCategory =
-        state.filters.category === "鍏ㄩ儴" || prompt.category === state.filters.category;
+        state.filters.category === "全部" || prompt.category === state.filters.category;
       const matchFavorite = !state.filters.favorite || prompt.favorite;
       return matchQuery && matchCategory && matchFavorite;
     })
@@ -1408,24 +1395,24 @@ function promptCard(prompt, options = {}) {
     <${element} class="prompt-item ${cover ? "has-cover" : ""} ${management ? "is-managing" : ""}" ${attrs}>
       ${
         management
-          ? `<label class="manage-check" aria-label="閫夋嫨 ${escapeHtml(prompt.title)}">
+          ? `<label class="manage-check" aria-label="选择 ${escapeHtml(prompt.title)}">
               <input type="checkbox" data-manage-checkbox="${prompt.id}" ${selected ? "checked" : ""} />
             </label>`
           : ""
       }
-      ${cover ? `<div class="prompt-cover"><img src="${cover}" alt="${escapeHtml(prompt.title)} 灏侀潰" /></div>` : ""}
+      ${cover ? `<div class="prompt-cover"><img src="${cover}" alt="${escapeHtml(prompt.title)} 封面" /></div>` : ""}
       <div class="prompt-card-main">
         <div class="prompt-head">
           <div>
             <h3 class="prompt-title">${escapeHtml(prompt.title)}</h3>
             <div class="prompt-meta">
-              <span class="pill">${escapeHtml(prompt.category || "鍏朵粬")}</span>
-              <span>鏇存柊浜?${formatDate(prompt.updatedAt)}</span>
+              <span class="pill">${escapeHtml(prompt.category || "其他")}</span>
+              <span>更新于 ${formatDate(prompt.updatedAt)}</span>
             </div>
           </div>
           <span class="${prompt.favorite ? "favorite" : "muted"}">${prompt.favorite ? "已收藏" : "未收藏"}</span>
         </div>
-        <div class="tag-row">${tags || '<span class="muted">鏆傛棤鏍囩</span>'}</div>
+        <div class="tag-row">${tags || '<span class="muted">暂无标签</span>'}</div>
       </div>
     </${element}>
   `;
@@ -1438,17 +1425,17 @@ function dashboardPromptCard(prompt, index) {
 
   return `
     <a class="dashboard-prompt" href="#/detail/${prompt.id}" onclick="rememberDetailSource('#/', '${prompt.id}')">
-      <div class="dashboard-thumb">${cover ? `<img src="${cover}" alt="${escapeHtml(prompt.title)} 灏侀潰" />` : fallback}</div>
+      <div class="dashboard-thumb">${cover ? `<img src="${cover}" alt="${escapeHtml(prompt.title)} 封面" />` : fallback}</div>
       <div class="dashboard-prompt-main">
         <h3>${escapeHtml(prompt.title)}</h3>
         <div class="prompt-meta">
-          <span class="pill">${escapeHtml(prompt.category || "鍏朵粬")}</span>
-          <span>鏇存柊浜?${formatDate(prompt.updatedAt)}</span>
+          <span class="pill">${escapeHtml(prompt.category || "其他")}</span>
+          <span>更新于 ${formatDate(prompt.updatedAt)}</span>
         </div>
-        <div class="tag-row">${tags || '<span class="muted">鏆傛棤鏍囩</span>'}</div>
+        <div class="tag-row">${tags || '<span class="muted">暂无标签</span>'}</div>
       </div>
-      <button class="mini-icon ${prompt.favorite ? "is-active" : ""}" type="button" aria-label="鏀惰棌">${icon("star")}</button>
-      <button class="mini-icon" type="button" aria-label="鏇村">${icon("more")}</button>
+      <button class="mini-icon ${prompt.favorite ? "is-active" : ""}" type="button" aria-label="收藏">${icon("star")}</button>
+      <button class="mini-icon" type="button" aria-label="更多">${icon("more")}</button>
     </a>
   `;
 }
@@ -1493,17 +1480,17 @@ function completedTodos(limit = 5) {
 function todoItem(todo) {
   return `
     <li class="todo-item ${todo.completed ? "is-completed" : ""}">
-      <button class="todo-check" type="button" data-todo-toggle="${todo.id}" aria-label="鍒囨崲浠诲姟瀹屾垚鐘舵€?>
+      <button class="todo-check" type="button" data-todo-toggle="${todo.id}" aria-label="切换任务完成状态">
         <span>${todo.completed ? "✓" : ""}</span>
       </button>
       <div class="todo-main">
         <p>${escapeHtml(todo.content)}</p>
         <div class="todo-meta">
-          <span>鎴 ${escapeHtml(formatTodoDate(todo.dueDate))}</span>
+          <span>截止 ${escapeHtml(formatTodoDate(todo.dueDate))}</span>
           <span class="todo-priority priority-${todo.priority}">${todoPriorityLabel(todo.priority)}</span>
         </div>
       </div>
-      <button class="todo-delete" type="button" data-todo-delete="${todo.id}" aria-label="鍒犻櫎浠诲姟">${icon("trash")}</button>
+      <button class="todo-delete" type="button" data-todo-delete="${todo.id}" aria-label="删除任务">${icon("trash")}</button>
     </li>
   `;
 }
@@ -1517,7 +1504,7 @@ function todoTimelineItem(todo) {
         <p>${escapeHtml(todo.content)}</p>
         <div class="todo-meta">
           <span class="todo-priority priority-${todo.priority}">${todoPriorityLabel(todo.priority)}</span>
-          <span>鎴 ${escapeHtml(formatTodoDate(todo.dueDate))}</span>
+          <span>截止 ${escapeHtml(formatTodoDate(todo.dueDate))}</span>
         </div>
       </div>
     </li>
@@ -1532,35 +1519,35 @@ function renderTodoDashboard() {
     <section class="card card-pad todo-board">
       <div class="section-head todo-board-head">
         <div>
-          <h2>浠婃棩寰呭姙 Todo List</h2>
-          <p>鑱氱劍浣犲綋鍓嶆渶閲嶈鐨勫垱浣滀换鍔?/p>
+          <h2>今日待办 Todo List</h2>
+          <p>聚焦你当前最重要的创作任务</p>
         </div>
       </div>
       <div class="todo-layout">
         <div class="todo-list-panel">
           <form class="todo-form" id="todoForm">
-            <input class="field todo-input" name="content" maxlength="120" placeholder="杈撳叆寰呭姙浠诲姟..." />
+            <input class="field todo-input" name="content" maxlength="120" placeholder="输入待办任务..." />
             <input class="field todo-date" name="dueDate" type="date" />
             <select class="select todo-priority-select" name="priority">
-              <option value="low">鏅€?/option>
-              <option value="medium">閲嶈</option>
-              <option value="high">绱ф€?/option>
+              <option value="low">普通</option>
+              <option value="medium">重要</option>
+              <option value="high">紧急</option>
             </select>
-            <button class="button todo-add" type="submit">${icon("plus")}娣诲姞浠诲姟</button>
+            <button class="button todo-add" type="submit">${icon("plus")}添加任务</button>
           </form>
           <div class="todo-list-scroll">
             <ul class="todo-list">
-              ${todos.length ? todos.map(todoItem).join("") : '<li class="todo-empty">浠婂ぉ杩樻病鏈夊緟鍔炰换鍔?/li>'}
+              ${todos.length ? todos.map(todoItem).join("") : '<li class="todo-empty">今天还没有待办任务</li>'}
             </ul>
           </div>
         </div>
         <aside class="todo-timeline-panel">
-          <h3>瀹屾垚鏃堕棿杞?/h3>
+          <h3>完成时间轴</h3>
           <div class="todo-timeline-scroll">
             ${
               timeline.length
                 ? `<ol class="todo-timeline">${timeline.map(todoTimelineItem).join("")}</ol>`
-                : '<div class="todo-timeline-empty">瀹屾垚浠诲姟鍚庯紝杩欓噷浼氱敓鎴愭椂闂磋酱銆?/div>'
+                : '<div class="todo-timeline-empty">完成任务后，这里会生成时间轴。</div>'
             }
           </div>
         </aside>
@@ -1611,7 +1598,7 @@ function bindTodoDashboard() {
     }
 
     if (deleteButton) {
-      if (!confirm("纭畾鍒犻櫎杩欎釜浠诲姟鍚楋紵")) return;
+      if (!confirm("确定删除这个任务吗？")) return;
       state.todos = state.todos.filter((todo) => todo.id !== deleteButton.dataset.todoDelete);
       saveTodos();
       renderDashboard();
@@ -1620,7 +1607,7 @@ function bindTodoDashboard() {
 }
 
 function renderDashboard() {
-  setTitle("棣栭〉 Dashboard");
+  setTitle("首页 Dashboard");
   const recent = [...state.prompts].sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))[0];
   const favCount = state.prompts.filter((prompt) => prompt.favorite).length;
   const topCategory = categoryCounts().sort((a, b) => b.count - a.count)[0];
@@ -1647,7 +1634,7 @@ function renderDashboard() {
         </div>
       </section>
       <section class="card card-pad category-card">
-        <h2>鍒嗙被鍒嗗竷</h2>
+        <h2>分类分布</h2>
         <div class="category-list">
           ${categoryCounts()
             .map(
@@ -1667,30 +1654,30 @@ function renderDashboard() {
     </div>
     <div class="grid dashboard-bottom-grid">
       <section class="card card-pad quick-card">
-        <h2>蹇€熸搷浣?/h2>
+        <h2>快速操作</h2>
         <div class="quick-actions">
-          <a href="#/edit" class="quick-action qa-mint">${icon("plus")}<span>鏂板缓 Prompt</span></a>
-          <a href="#/settings" class="quick-action qa-green">${icon("upload")}<span>瀵煎叆 Prompt</span></a>
-          <a href="#/settings" class="quick-action qa-yellow">${icon("download")}<span>瀵煎嚭鏁版嵁</span></a>
-          <a href="#/categories" class="quick-action qa-orange">${icon("folder")}<span>鍒嗙被绠＄悊</span></a>
-          <a href="#/settings" class="quick-action qa-purple">${icon("cog")}<span>璁剧疆</span></a>
+          <a href="#/edit" class="quick-action qa-mint">${icon("plus")}<span>新建 Prompt</span></a>
+          <a href="#/settings" class="quick-action qa-green">${icon("upload")}<span>导入 Prompt</span></a>
+          <a href="#/settings" class="quick-action qa-yellow">${icon("download")}<span>导出数据</span></a>
+          <a href="#/categories" class="quick-action qa-orange">${icon("folder")}<span>分类管理</span></a>
+          <a href="#/settings" class="quick-action qa-purple">${icon("cog")}<span>设置</span></a>
         </div>
       </section>
       <section class="card card-pad tips-card">
-        <h2>${icon("lightbulb")}浣跨敤灏忚创澹?/h2>
-        <p>鐐瑰嚮 ${icon("star")} 鏀惰棌閲嶈鐨?Prompt锛屾柟渚垮揩閫熸煡鎵?/p>
-        <p>浣跨敤鍒嗙被绠＄悊锛岃浣犵殑 Prompt 浜曚簳鏈夋潯</p>
-        <p>鏀寔鍥剧墖涓婁紶锛岃 Prompt 鏇寸敓鍔ㄧ洿瑙?/p>
+        <h2>${icon("lightbulb")}使用小贴士</h2>
+        <p>点击 ${icon("star")} 收藏重要的 Prompt，方便快速查找</p>
+        <p>使用分类管理，让你的 Prompt 井井有条</p>
+        <p>支持图片上传，让 Prompt 更生动直观</p>
       </section>
     </div>
-    <p class="made-with-love">鉂わ笍 Made with love by PromptBox</p>
+    <p class="made-with-love">❤️ Made with love by PromptBox</p>
   `;
 
   bindTodoDashboard();
 }
 
 function renderPromptList() {
-  setTitle("Prompt 鍒楄〃");
+  setTitle("Prompt 列表");
   const existingIds = new Set(state.prompts.map((prompt) => prompt.id));
   state.management.selected.forEach((id) => {
     if (!existingIds.has(id)) state.management.selected.delete(id);
@@ -1700,27 +1687,27 @@ function renderPromptList() {
   app.innerHTML = `
     <section class="card card-pad">
       <div class="toolbar">
-        <input class="field search-field" id="searchInput" placeholder="鎼滅储鏍囬銆佹鏂囥€佹爣绛? value="${escapeHtml(state.filters.query)}" />
+        <input class="field search-field" id="searchInput" placeholder="搜索标题、正文、标签" value="${escapeHtml(state.filters.query)}" />
         <select class="select" id="categoryFilter">
-          <option>鍏ㄩ儴</option>
+          <option>全部</option>
           ${state.categories.map((name) => `<option ${state.filters.category === name ? "selected" : ""}>${escapeHtml(name)}</option>`).join("")}
         </select>
-        <button class="ghost-button" id="favoriteFilter">${icon("heart")}${state.filters.favorite ? "鍏ㄩ儴 Prompt" : "鍙湅鏀惰棌"}</button>
-        <button class="ghost-button" id="manageToggle">${icon("sliders")}${state.management.enabled ? "鍙栨秷绠＄悊" : "绠＄悊"}</button>
+        <button class="ghost-button" id="favoriteFilter">${icon("heart")}${state.filters.favorite ? "全部 Prompt" : "只看收藏"}</button>
+        <button class="ghost-button" id="manageToggle">${icon("sliders")}${state.management.enabled ? "取消管理" : "管理"}</button>
       </div>
       ${
         state.management.enabled
           ? `<div class="bulk-bar">
-              <strong>宸查€夋嫨 ${selectedCount} 椤?/strong>
-              <button class="ghost-button" id="selectAllBtn">${icon("check")}鍏ㄩ€?/button>
-              <button class="ghost-button" id="clearSelectBtn">${icon("x")}鍙栨秷閫夋嫨</button>
-              <button class="danger-button" id="deleteSelectedBtn" ${selectedCount ? "" : "disabled"}>${icon("trash")}鍒犻櫎鎵€閫?/button>
+              <strong>已选择 ${selectedCount} 项</strong>
+              <button class="ghost-button" id="selectAllBtn">${icon("check")}全选</button>
+              <button class="ghost-button" id="clearSelectBtn">${icon("x")}取消选择</button>
+              <button class="danger-button" id="deleteSelectedBtn" ${selectedCount ? "" : "disabled"}>${icon("trash")}删除所选</button>
             </div>`
           : ""
       }
     </section>
     <section class="prompt-list">
-      ${items.length ? items.map((prompt) => promptCard(prompt, { source: "#/prompts", management: state.management.enabled })).join("") : empty("娌℃湁鍖归厤鐨?Prompt")}
+      ${items.length ? items.map((prompt) => promptCard(prompt, { source: "#/prompts", management: state.management.enabled })).join("") : empty("没有匹配的 Prompt")}
     </section>
   `;
 
@@ -1773,7 +1760,7 @@ function renderPromptList() {
     state.prompts = state.prompts.filter((prompt) => !selectedIds.has(prompt.id));
     state.management.selected.clear();
     save();
-    showToast("宸插垹闄ゆ墍閫?Prompt");
+    showToast("已删除所选 Prompt");
     renderPromptList();
   });
 }
@@ -1781,11 +1768,11 @@ function renderPromptList() {
 function renderEdit(id) {
   const editing = state.prompts.find((prompt) => prompt.id === id);
   if (!editing) state.returnContext = null;
-  setTitle(editing ? "缂栬緫 Prompt" : "鏂板缓 Prompt");
+  setTitle(editing ? "编辑 Prompt" : "新建 Prompt");
   const prompt = editing || {
     title: "",
     body: "",
-    category: state.categories[0] || "鍏朵粬",
+    category: state.categories[0] || "其他",
     tags: [],
     note: "",
     favorite: false,
@@ -1797,63 +1784,63 @@ function renderEdit(id) {
 
   app.innerHTML = `
     <form class="card card-pad form" id="promptForm">
-      <label class="label">鏍囬
+      <label class="label">标题
         <input class="field" name="title" required maxlength="80" value="${escapeHtml(prompt.title)}" />
       </label>
-      <label class="label">姝ｆ枃
-        <div class="format-toolbar" id="formatToolbar" aria-label="姝ｆ枃鏍煎紡宸ュ叿鏍?>
-          <button class="format-button format-bold" type="button" data-format="bold" title="鍔犵矖">B</button>
-          <button class="format-button" type="button" data-format="highlight" title="楂樹寒">楂樹寒</button>
+      <label class="label">正文
+        <div class="format-toolbar" id="formatToolbar" aria-label="正文格式工具栏">
+          <button class="format-button format-bold" type="button" data-format="bold" title="加粗">B</button>
+          <button class="format-button" type="button" data-format="highlight" title="高亮">高亮</button>
           <span class="format-divider"></span>
-          <span class="format-label">瀛楀彿</span>
-          <button class="format-button" type="button" data-format="small">灏?/button>
-          <button class="format-button" type="button" data-format="default">榛樿</button>
-          <button class="format-button" type="button" data-format="large">澶?/button>
+          <span class="format-label">字号</span>
+          <button class="format-button" type="button" data-format="small">小</button>
+          <button class="format-button" type="button" data-format="default">默认</button>
+          <button class="format-button" type="button" data-format="large">大</button>
         </div>
         <textarea class="textarea" name="body" required>${escapeHtml(prompt.body)}</textarea>
       </label>
       <section class="mind-map-panel">
         <div class="mind-map-head">
           <div>
-            <h3>鎬濈淮瀵煎浘</h3>
-            <p>鍙屽嚮绌虹櫧澶勫垱寤鸿妭鐐癸紝杈撳叆鏂囧瓧鍚庢寜绌烘牸閿佸畾锛屾寜 Tab 鍒涘缓瀛愯妭鐐广€?/p>
+            <h3>思维导图</h3>
+            <p>双击空白处创建节点，输入文字后按空格锁定，按 Tab 创建子节点。</p>
           </div>
           <div class="mind-map-tools">
-            <span id="mindMapCount">0 涓妭鐐?/span>
-            <button class="ghost-button" id="mindMapClear" type="button">娓呯┖瀵煎浘</button>
+            <span id="mindMapCount">0 个节点</span>
+            <button class="ghost-button" id="mindMapClear" type="button">清空导图</button>
           </div>
         </div>
         <div class="mind-map-scroll mindmap-viewport">
-          <div class="mind-map-canvas mindmap-canvas" id="mindMapCanvas" tabindex="0" aria-label="鎬濈淮瀵煎浘鐢诲竷"></div>
+          <div class="mind-map-canvas mindmap-canvas" id="mindMapCanvas" tabindex="0" aria-label="思维导图画布"></div>
         </div>
       </section>
-      <section class="label image-field">涓婁紶鍥剧墖
+      <section class="label image-field">上传图片
         <label class="image-upload-card" for="imageInput">
-          <span>+ 娣诲姞鍥剧墖</span>
-          <small>鏀寔 JPG銆丳NG銆乄EBP锛屽彲閫夋嫨澶氬紶</small>
+          <span>+ 添加图片</span>
+          <small>支持 JPG、PNG、WEBP，可选择多张</small>
         </label>
         <input class="file-input" id="imageInput" type="file" accept="image/jpeg,image/png,image/webp" multiple />
         <div class="image-preview-list" id="imagePreviewList"></div>
       </section>
       <div class="form-row">
-        <label class="label">鍒嗙被
+        <label class="label">分类
           <select class="select" name="category">
             ${state.categories.map((name) => `<option ${prompt.category === name ? "selected" : ""}>${escapeHtml(name)}</option>`).join("")}
           </select>
         </label>
-        <label class="label">鏍囩
-          <input class="field" name="tags" placeholder="鐢ㄩ€楀彿鍒嗛殧" value="${escapeHtml((prompt.tags || []).join(", "))}" />
+        <label class="label">标签
+          <input class="field" name="tags" placeholder="用逗号分隔" value="${escapeHtml((prompt.tags || []).join(", "))}" />
         </label>
       </div>
-      <label class="label">澶囨敞
+      <label class="label">备注
         <textarea class="textarea" name="note">${escapeHtml(prompt.note || "")}</textarea>
       </label>
       <label class="label">
-        <span><input type="checkbox" name="favorite" ${prompt.favorite ? "checked" : ""} /> 鏀惰棌</span>
+        <span><input type="checkbox" name="favorite" ${prompt.favorite ? "checked" : ""} /> 收藏</span>
       </label>
       <div class="actions">
-        <button class="button" type="submit">${icon("check")}淇濆瓨</button>
-        <a class="ghost-button" href="${editing ? `#/detail/${editing.id}` : "#/prompts"}">鍙栨秷</a>
+        <button class="button" type="submit">${icon("check")}保存</button>
+        <a class="ghost-button" href="${editing ? `#/detail/${editing.id}` : "#/prompts"}">取消</a>
       </div>
     </form>
   `;
@@ -1934,7 +1921,7 @@ function renderEdit(id) {
 function renderDetail(id) {
   const prompt = state.prompts.find((item) => item.id === id);
   if (!prompt) {
-    setTitle("Prompt 璇︽儏");
+    setTitle("Prompt 详情");
     app.innerHTML = empty("这个 Prompt 不存在");
     return;
   }
@@ -1942,20 +1929,20 @@ function renderDetail(id) {
   setTitle(prompt.title);
   app.innerHTML = `
     <article class="card card-pad detail-card">
-      <button class="back-button" id="backBtn" type="button">${icon("arrowLeft")}杩斿洖</button>
+      <button class="back-button" id="backBtn" type="button">${icon("arrowLeft")}返回</button>
       <div class="detail-top">
         <div>
           <h2 class="detail-title">${escapeHtml(prompt.title)}</h2>
         </div>
         <div class="actions">
-          <button class="icon-button" id="copyBtn">${icon("copy")}澶嶅埗</button>
+          <button class="icon-button" id="copyBtn">${icon("copy")}复制</button>
           <button class="favorite-button ${prompt.favorite ? "is-active" : ""}" id="favoriteBtn">${icon("heart")}${prompt.favorite ? "已收藏" : "收藏"}</button>
         </div>
       </div>
       ${detailImageGallery(prompt.images)}
       <div class="prompt-meta detail-meta">
         <span class="pill">${escapeHtml(prompt.category)}</span>
-        <span>鏇存柊浜?${formatDate(prompt.updatedAt)}</span>
+        <span>更新于 ${formatDate(prompt.updatedAt)}</span>
         <span class="favorite-state ${prompt.favorite ? "is-active" : ""}">${prompt.favorite ? "已收藏" : "未收藏"}</span>
       </div>
       <div class="tag-row">${(prompt.tags || []).map((tag) => `<span class="tag">#${escapeHtml(tag)}</span>`).join("")}</div>
@@ -1963,10 +1950,10 @@ function renderDetail(id) {
         <section class="detail-reading-card detail-body">${renderFormattedPromptBody(prompt.body)}</section>
         ${renderReadonlyMindMap(prompt.mindMap)}
       </div>
-      ${prompt.note ? `<div class="detail-note"><h3>澶囨敞</h3><div class="note-box">${escapeHtml(prompt.note)}</div></div>` : ""}
+      ${prompt.note ? `<div class="detail-note"><h3>备注</h3><div class="note-box">${escapeHtml(prompt.note)}</div></div>` : ""}
       <div class="actions">
-        <a class="button" href="#/edit/${prompt.id}">${icon("pencil")}缂栬緫</a>
-        <button class="danger-button" id="deleteBtn">${icon("trash")}鍒犻櫎</button>
+        <a class="button" href="#/edit/${prompt.id}">${icon("pencil")}编辑</a>
+        <button class="danger-button" id="deleteBtn">${icon("trash")}删除</button>
       </div>
     </article>
   `;
@@ -1997,7 +1984,7 @@ function renderDetail(id) {
     renderDetail(id);
   });
   document.querySelector("#deleteBtn").addEventListener("click", () => {
-    if (!confirm("纭畾鍒犻櫎杩欎釜 Prompt 鍚楋紵")) return;
+    if (!confirm("确定删除这个 Prompt 吗？")) return;
     state.prompts = state.prompts.filter((item) => item.id !== id);
     save();
     showToast("已删除");
@@ -2006,13 +1993,13 @@ function renderDetail(id) {
 }
 
 function renderCategories() {
-  setTitle("鍒嗙被绠＄悊");
+  setTitle("分类管理");
   app.innerHTML = `
     <section class="card card-pad form">
       <form class="toolbar" id="categoryForm">
-        <input class="field" name="name" maxlength="16" placeholder="鏂板鍒嗙被鍚嶇О" />
-        <button class="button" type="submit">${icon("plus")}娣诲姞鍒嗙被</button>
-        <a class="ghost-button" href="#/prompts">${icon("arrowLeft")}杩斿洖鍒楄〃</a>
+        <input class="field" name="name" maxlength="16" placeholder="新增分类名称" />
+        <button class="button" type="submit">${icon("plus")}添加分类</button>
+        <a class="ghost-button" href="#/prompts">${icon("arrowLeft")}返回列表</a>
       </form>
       <div class="category-list">
         ${state.categories
@@ -2020,8 +2007,8 @@ function renderCategories() {
             (name) => `
               <div class="category-item">
                 <input class="field" data-category-input="${escapeHtml(name)}" value="${escapeHtml(name)}" />
-                <span class="muted">${state.prompts.filter((prompt) => prompt.category === name).length} 鏉?/span>
-                <button class="danger-button" data-delete-category="${escapeHtml(name)}">${icon("trash")}鍒犻櫎</button>
+                <span class="muted">${state.prompts.filter((prompt) => prompt.category === name).length} 条</span>
+                <button class="danger-button" data-delete-category="${escapeHtml(name)}">${icon("trash")}删除</button>
               </div>
             `
           )
@@ -2088,7 +2075,7 @@ function deleteCategory(name) {
   renderCategories();
 }
 
-async function uploadLocalDataToSupabase() {
+async function migrateLocalDataToCloud() {
   const localPrompts = readStorageData(STORAGE_KEY);
   let localTodos = [];
 
@@ -2096,7 +2083,7 @@ async function uploadLocalDataToSupabase() {
     const rawTodos = localStorage.getItem(TODO_STORAGE_KEY);
     localTodos = rawTodos ? JSON.parse(rawTodos).map(normalizeTodo).filter((todo) => todo.content) : [];
   } catch (error) {
-    console.error("璇诲彇鏈湴 Todo 杩佺Щ鏁版嵁澶辫触", error);
+    console.error("读取本地 Todo 迁移数据失败", error);
   }
 
   const mergedPrompts = mergeDataSets(currentData(), localPrompts);
@@ -2111,50 +2098,46 @@ async function uploadLocalDataToSupabase() {
   localStorage.setItem(STORAGE_KEY, serializedData(currentData()));
   localStorage.setItem(TODO_STORAGE_KEY, JSON.stringify(state.todos.map(normalizeTodo)));
 
-  const promptsSynced = await syncSupabasePrompts(currentData());
-  const todosSynced = await syncSupabaseRows(SUPABASE_TODOS_TABLE, state.todos, normalizeTodo);
+  const promptsSynced = await syncCloudPrompts(currentData());
+  const todosSynced = await syncCloudCollection(CLOUD_TODOS_COLLECTION, state.todos, normalizeTodo);
 
   if (promptsSynced || todosSynced) {
-    showToast("本地数据已上传到云端");
+    showToast("本地数据已迁移到云端");
   }
 }
 
 function renderSettings() {
-  setTitle("璁剧疆");
+  setTitle("设置");
   const usage = localStorageUsage();
   const usagePercent = Math.round((usage / LOCAL_STORAGE_LIMIT) * 100);
   app.innerHTML = `
     <section class="grid content-grid">
       <div class="card card-pad form">
-        <h2>鏁版嵁澶囦唤</h2>
+        <h2>数据备份</h2>
         <div class="actions">
-          <button class="button" id="exportBtn">${icon("download")}瀵煎嚭鏁版嵁</button>
-          <label class="ghost-button" for="importFile">${icon("upload")}瀵煎叆鏁版嵁</label>
+          <button class="button" id="exportBtn">${icon("download")}导出数据</button>
+          <label class="ghost-button" for="importFile">${icon("upload")}导入数据</label>
           <input class="file-input" id="importFile" type="file" accept="application/json,.json" />
         </div>
       </div>
       <div class="card card-pad form">
-        <h2>鏈湴鏁版嵁</h2>
-        <p class="muted">褰撳墠娴忚鍣ㄥ唴鍏辨湁 ${state.prompts.length} 鏉?Prompt锛?{state.categories.length} 涓垎绫汇€?/p>
+        <h2>本地数据</h2>
+        <p class="muted">当前浏览器内共有 ${state.prompts.length} 条 Prompt，${state.categories.length} 个分类。</p>
         <div class="storage-debug">
-          <span>褰撳墠瀛樺偍鏉℃暟锛?{state.prompts.length}</span>
-          <span>褰撳墠 storage key锛?{STORAGE_KEY}</span>
-          <span>褰撳墠宸蹭娇鐢細${formatBytes(usage)} / 5 MB锛?{usagePercent}%锛?/span>
+          <span>当前存储条数：${state.prompts.length}</span>
+          <span>当前 storage key：${STORAGE_KEY}</span>
+          <span>当前已使用：${formatBytes(usage)} / 5 MB（${usagePercent}%）</span>
           <div class="storage-meter"><span style="width:${Math.min(usagePercent, 100)}%"></span></div>
           ${
             usagePercent >= STORAGE_WARNING_RATIO * 100
-              ? '<strong class="storage-warning">鏈湴瀛樺偍绌洪棿杈冮珮锛屽缓璁鍑哄浠芥垨鍒犻櫎閮ㄥ垎鍥剧墖銆?/strong>'
+              ? '<strong class="storage-warning">本地存储空间较高，建议导出备份或删除部分图片。</strong>'
               : ""
           }
         </div>
-        <div class="storage-debug">
-          <span>云同步状态：${escapeHtml(syncStatus)}</span>
-        </div>
-        <button class="ghost-button" id="testSaveBtn">${icon("check")}娴嬭瘯淇濆瓨</button>
-        <button class="ghost-button" id="manualSyncBtn">${icon("check")}手动同步</button>
-        <button class="ghost-button" id="uploadLocalBtn">${icon("upload")}上传本地数据到云端</button>
-        <button class="ghost-button" id="logoutBtn">${icon("x")}閫€鍑虹櫥褰?/button>
-        <button class="danger-button" id="clearBtn">${icon("trash")}娓呯┖鏈湴鏁版嵁</button>
+        <button class="ghost-button" id="testSaveBtn">${icon("check")}测试保存</button>
+        <button class="ghost-button" id="migrateCloudBtn">${icon("upload")}迁移本地数据到云端</button>
+        <button class="ghost-button" id="logoutBtn">${icon("x")}退出登录</button>
+        <button class="danger-button" id="clearBtn">${icon("trash")}清空本地数据</button>
       </div>
     </section>
   `;
@@ -2166,10 +2149,10 @@ function renderSettings() {
     state.prompts.unshift(
       normalizePrompt({
         id: uid(),
-        title: `娴嬭瘯淇濆瓨 ${formatDate(createdAt)}`,
-        body: "这是一条用于验证云同步和本地缓存的测试 Prompt。",
-        category: state.categories[0] || "鍏朵粬",
-        tags: ["娴嬭瘯淇濆瓨"],
+        title: `测试保存 ${formatDate(createdAt)}`,
+        body: "这是一条用于验证 localStorage 持久化的测试 Prompt。刷新或重新打开页面后，它应该仍然存在。",
+        category: state.categories[0] || "其他",
+        tags: ["测试保存"],
         note: "可在验证后手动删除。",
         favorite: false,
         images: [],
@@ -2181,14 +2164,13 @@ function renderSettings() {
     showToast("测试 Prompt 已保存");
     renderSettings();
   });
-  document.querySelector("#manualSyncBtn").addEventListener("click", manualSync);
-  document.querySelector("#uploadLocalBtn").addEventListener("click", async () => {
-    await uploadLocalDataToSupabase();
+  document.querySelector("#migrateCloudBtn").addEventListener("click", async () => {
+    await migrateLocalDataToCloud();
     renderSettings();
   });
   document.querySelector("#logoutBtn").addEventListener("click", logoutPrivateAccess);
   document.querySelector("#clearBtn").addEventListener("click", () => {
-    if (!confirm("纭畾娓呯┖鏈湴鏁版嵁鍚楋紵")) return;
+    if (!confirm("确定清空本地数据吗？")) return;
     state.prompts = [];
     state.categories = [...DEFAULT_CATEGORIES];
     state.todos = [];
@@ -2239,9 +2221,9 @@ function importJson(event) {
       const merged = mergeDataSets(currentData(), imported);
       state.prompts = merged.prompts;
       state.categories = merged.categories;
-      if (!state.categories.includes("鍏朵粬")) state.categories.push("鍏朵粬");
+      if (!state.categories.includes("其他")) state.categories.push("其他");
       state.prompts.forEach((prompt) => {
-        if (!state.categories.includes(prompt.category)) prompt.category = "鍏朵粬";
+        if (!state.categories.includes(prompt.category)) prompt.category = "其他";
       });
       if (Array.isArray(parsed.todos)) {
         const todoMap = new Map(state.todos.map((todo) => [todo.id, normalizeTodo(todo)]));
@@ -2253,7 +2235,7 @@ function importJson(event) {
       showToast("数据已导入");
       renderSettings();
     } catch {
-      showToast("瀵煎叆澶辫触锛岃妫€鏌?JSON 鏂囦欢");
+      showToast("导入失败，请检查 JSON 文件");
     }
   };
   reader.readAsText(file);
@@ -2273,7 +2255,7 @@ async function init() {
 
   showAppShell();
   try {
-    initSupabase();
+    await initCloudBase();
     await load();
     await loadTodos();
     cleanupTodos();
