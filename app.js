@@ -125,6 +125,42 @@ function isSupportedImageDataUrl(value) {
   return typeof value === "string" && /^data:image\/(jpeg|png|webp);base64,/i.test(value);
 }
 
+const MAX_PROMPT_FILE_SIZE = 3 * 1024 * 1024;
+const SUPPORTED_PROMPT_FILE_TYPES = new Set([
+  "application/pdf",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.ms-powerpoint",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "text/plain",
+  "application/zip",
+  "application/x-zip-compressed",
+  "application/postscript",
+  "application/illustrator",
+  "application/photoshop",
+  "image/vnd.adobe.photoshop",
+]);
+const SUPPORTED_PROMPT_FILE_EXTENSIONS = new Set(["pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "txt", "zip", "ai", "psd"]);
+
+function normalizePromptFile(file = {}) {
+  if (!file || !file.dataUrl) return null;
+  return {
+    id: file.id || `file_${uid()}`,
+    name: String(file.name || "附件文件"),
+    type: String(file.type || "application/octet-stream"),
+    size: Number.isFinite(Number(file.size)) ? Number(file.size) : 0,
+    dataUrl: String(file.dataUrl),
+    createdAt: file.createdAt || nowIso(),
+  };
+}
+
+function isSupportedPromptFile(file) {
+  const extension = String(file.name || "").split(".").pop().toLowerCase();
+  return SUPPORTED_PROMPT_FILE_TYPES.has(file.type) || SUPPORTED_PROMPT_FILE_EXTENSIONS.has(extension);
+}
+
 function normalizeMindMap(mindMap = {}) {
   const nodes = Array.isArray(mindMap.nodes)
     ? mindMap.nodes
@@ -163,6 +199,7 @@ function normalizePrompt(prompt = {}) {
     note: prompt.note || "",
     favorite: Boolean(prompt.favorite),
     images: Array.isArray(prompt.images) ? prompt.images.filter(isSupportedImageDataUrl) : [],
+    files: Array.isArray(prompt.files) ? prompt.files.map(normalizePromptFile).filter(Boolean) : [],
     mindMap: normalizeMindMap(prompt.mindMap),
     createdAt: prompt.createdAt || nowIso(),
     updatedAt: prompt.updatedAt || nowIso(),
@@ -782,6 +819,41 @@ function readImageFiles(files) {
   });
 }
 
+function readPromptFiles(files) {
+  const accepted = [];
+  [...files].forEach((file) => {
+    if (file.size > MAX_PROMPT_FILE_SIZE) {
+      showToast("文件过大，请压缩后上传");
+      return;
+    }
+    if (!isSupportedPromptFile(file)) {
+      showToast("不支持的文件类型");
+      return;
+    }
+    accepted.push(file);
+  });
+
+  return Promise.all(
+    accepted.map(
+      (file) =>
+        new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onerror = reject;
+          reader.onload = () =>
+            resolve({
+              id: `file_${uid()}`,
+              name: file.name,
+              type: file.type || "application/octet-stream",
+              size: file.size,
+              dataUrl: reader.result,
+              createdAt: nowIso(),
+            });
+          reader.readAsDataURL(file);
+        })
+    )
+  );
+}
+
 function renderImagePreviews(images) {
   const wrap = document.querySelector("#imagePreviewList");
   if (!wrap) return;
@@ -799,6 +871,43 @@ function renderImagePreviews(images) {
         )
         .join("")
     : '<p class="image-empty">第一张图片会作为封面图</p>';
+}
+
+function renderFileList(files, options = {}) {
+  if (!files.length) return `<p class="${options.detail ? "file-empty" : "image-empty"}">暂无附件文件</p>`;
+  return files
+    .map((file, index) => {
+      const safeName = escapeHtml(file.name);
+      const action = options.detail
+        ? `<button class="ghost-button file-download" type="button" data-download-file="${index}">${icon("download")}下载</button>`
+        : `<button class="image-remove file-remove" type="button" data-remove-file="${index}">删除</button>`;
+      return `
+        <div class="file-item">
+          <span class="file-icon">${icon("file")}</span>
+          <div class="file-info">
+            <strong title="${safeName}">${safeName}</strong>
+            <small>${formatBytes(file.size)}</small>
+          </div>
+          ${action}
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function renderFilePreviews(files) {
+  const wrap = document.querySelector("#filePreviewList");
+  if (wrap) wrap.innerHTML = renderFileList(files);
+}
+
+function downloadPromptFile(file) {
+  if (!file?.dataUrl) return;
+  const link = document.createElement("a");
+  link.href = file.dataUrl;
+  link.download = file.name || "promptbox-file";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
 }
 
 function flashFormatControl(control) {
@@ -871,27 +980,59 @@ function mindMapLevelClass(node = {}) {
 
 const MIND_MAP_CANVAS_WIDTH = 2400;
 const MIND_MAP_CANVAS_HEIGHT = 1400;
-const MIND_MAP_NODE_WIDTH = 240;
-const MIND_MAP_NODE_HEIGHT = 90;
+const MIND_MAP_NODE_WIDTH = 260;
+const MIND_MAP_NODE_HEIGHT = 120;
+const MIND_MAP_MIN_SCALE = 0.5;
+const MIND_MAP_MAX_SCALE = 1.8;
 
-function mindMapPath(fromNode, toNode) {
-  const startX = fromNode.x + 192;
-  const startY = fromNode.y + 36;
-  const endX = toNode.x;
-  const endY = toNode.y + 36;
-  const distance = Math.max(120, Math.abs(endX - startX));
-  const curve = Math.min(180, distance * 0.55);
-  return `M ${startX} ${startY} C ${startX + curve} ${startY}, ${endX - curve} ${endY}, ${endX} ${endY}`;
+function getMindMapScale(viewport) {
+  return Number(viewport?.dataset.mindScale) || 1;
 }
 
-function renderMindMapSvg(mindMap) {
+function escapeCssIdentifier(value) {
+  return window.CSS?.escape ? CSS.escape(value) : String(value).replace(/["\\]/g, "\\$&");
+}
+
+function getMindNodeMetrics(node, canvas) {
+  const element = canvas?.querySelector?.(`[data-mind-node="${escapeCssIdentifier(node.id)}"]`);
+  if (element) {
+    return {
+      x: node.x,
+      y: node.y,
+      width: element.offsetWidth || 160,
+      height: element.offsetHeight || 64,
+    };
+  }
+  const text = String(node.text || "双击编辑");
+  const width = Math.min(260, Math.max(96, text.length * 14 + 36));
+  const lines = Math.max(1, Math.ceil(width >= 260 ? text.length / 18 : 1));
+  return {
+    x: node.x,
+    y: node.y,
+    width,
+    height: Math.max(48, lines * 22 + 24),
+  };
+}
+
+function mindMapPath(fromNode, toNode, canvas) {
+  const from = getMindNodeMetrics(fromNode, canvas);
+  const to = getMindNodeMetrics(toNode, canvas);
+  const x1 = from.x + from.width;
+  const y1 = from.y + from.height / 2;
+  const x2 = to.x;
+  const y2 = to.y + to.height / 2;
+  const dx = Math.min(80, Math.max(40, Math.abs(x2 - x1) * 0.35));
+  return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+}
+
+function renderMindMapSvg(mindMap, canvas) {
   const nodeMap = new Map(mindMap.nodes.map((node) => [node.id, node]));
   const paths = mindMap.edges
     .map((edge) => {
       const fromNode = nodeMap.get(edge.from);
       const toNode = nodeMap.get(edge.to);
       if (!fromNode || !toNode) return "";
-      return `<path class="mind-edge-path" d="${mindMapPath(fromNode, toNode)}" />`;
+      return `<path class="mind-edge-path" d="${mindMapPath(fromNode, toNode, canvas)}" />`;
     })
     .join("");
 
@@ -939,24 +1080,81 @@ function renderReadonlyMindMap(mindMap = {}) {
     <section class="mind-map-preview">
       <div class="mind-map-preview-head">
         <h3>思维导图预览</h3>
-        <span>${safeMap.nodes.length} 个节点</span>
+        <div class="mind-map-tools">
+          <span>${safeMap.nodes.length} 个节点</span>
+          <span class="mind-map-scale-value" data-mind-scale-value>100%</span>
+          <button class="ghost-button mind-map-reset" type="button" data-mind-scale-reset>重置缩放</button>
+        </div>
       </div>
       <div class="mind-map-scroll mindmap-viewport mind-map-readonly" data-preview-scroll-x="${scrollX}" data-preview-scroll-y="${scrollY}">
-        <div class="mind-map-canvas mindmap-canvas">
-          <svg class="mind-map-lines" width="${MIND_MAP_CANVAS_WIDTH}" height="${MIND_MAP_CANVAS_HEIGHT}" viewBox="0 0 ${MIND_MAP_CANVAS_WIDTH} ${MIND_MAP_CANVAS_HEIGHT}" aria-hidden="true">
-            ${renderMindMapSvg(safeMap)}
-          </svg>
-          ${renderMindMapNodes(safeMap, null, null)}
+        <div class="mindmap-scale-layer">
+          <div class="mind-map-canvas mindmap-canvas">
+            <svg class="mind-map-lines" width="${MIND_MAP_CANVAS_WIDTH}" height="${MIND_MAP_CANVAS_HEIGHT}" viewBox="0 0 ${MIND_MAP_CANVAS_WIDTH} ${MIND_MAP_CANVAS_HEIGHT}" aria-hidden="true">
+              ${renderMindMapSvg(safeMap)}
+            </svg>
+            ${renderMindMapNodes(safeMap, null, null)}
+          </div>
         </div>
       </div>
     </section>
   `;
 }
 
+function setupMindMapZoom(viewport) {
+  if (!viewport) return;
+  const layer = viewport.querySelector(".mindmap-scale-layer") || viewport;
+  const canvas = viewport.querySelector(".mindmap-canvas");
+  const panel = viewport.closest(".mind-map-panel, .mind-map-preview");
+  const value = panel?.querySelector("[data-mind-scale-value]");
+  const reset = panel?.querySelector("[data-mind-scale-reset]");
+
+  const applyScale = (nextScale, center) => {
+    const oldScale = getMindMapScale(viewport);
+    const scale = Math.min(MIND_MAP_MAX_SCALE, Math.max(MIND_MAP_MIN_SCALE, Number(nextScale) || 1));
+    const rect = viewport.getBoundingClientRect();
+    const mouseX = center ? center.clientX - rect.left : viewport.clientWidth / 2;
+    const mouseY = center ? center.clientY - rect.top : viewport.clientHeight / 2;
+    const contentX = (viewport.scrollLeft + mouseX) / oldScale;
+    const contentY = (viewport.scrollTop + mouseY) / oldScale;
+
+    viewport.dataset.mindScale = String(scale);
+    layer.style.width = `${MIND_MAP_CANVAS_WIDTH * scale}px`;
+    layer.style.height = `${MIND_MAP_CANVAS_HEIGHT * scale}px`;
+    if (canvas) {
+      canvas.style.transform = `scale(${scale})`;
+      canvas.style.transformOrigin = "0 0";
+    }
+    if (value) value.textContent = `${Math.round(scale * 100)}%`;
+
+    viewport.scrollLeft = contentX * scale - mouseX;
+    viewport.scrollTop = contentY * scale - mouseY;
+  };
+
+  applyScale(getMindMapScale(viewport));
+  viewport.addEventListener(
+    "wheel",
+    (event) => {
+      if (!event.ctrlKey) return;
+      event.preventDefault();
+      applyScale(getMindMapScale(viewport) + (event.deltaY < 0 ? 0.08 : -0.08), event);
+    },
+    { passive: false }
+  );
+  reset?.addEventListener("click", () => applyScale(1));
+}
+
 function positionReadonlyMindMapPreviews() {
   document.querySelectorAll(".mind-map-readonly[data-preview-scroll-x]").forEach((viewport) => {
+    setupMindMapZoom(viewport);
     viewport.scrollLeft = Number(viewport.dataset.previewScrollX) || 0;
     viewport.scrollTop = Number(viewport.dataset.previewScrollY) || 0;
+    requestAnimationFrame(() => {
+      const canvas = viewport.querySelector(".mindmap-canvas");
+      const svg = canvas?.querySelector(".mind-map-lines");
+      if (!svg) return;
+      const prompt = state.prompts.find((item) => item.id === routeParts()[1]);
+      svg.innerHTML = renderMindMapSvg(normalizeMindMap(prompt?.mindMap), canvas);
+    });
   });
 }
 
@@ -1022,6 +1220,7 @@ function bindMindMapEditor(mindMap) {
   let editingOriginalText = "";
   let dragState = null;
   const viewport = canvas.closest(".mindmap-viewport") || canvas.parentElement;
+  setupMindMapZoom(viewport);
 
   const stopMindEvent = (event) => {
     event.preventDefault();
@@ -1033,9 +1232,10 @@ function bindMindMapEditor(mindMap) {
   const clampY = (value) => Math.max(24, Math.min(MIND_MAP_CANVAS_HEIGHT - MIND_MAP_NODE_HEIGHT, Math.round(value)));
   const getCanvasPoint = (event) => {
     const rect = viewport.getBoundingClientRect();
+    const scale = getMindMapScale(viewport);
     return {
-      x: event.clientX - rect.left + viewport.scrollLeft,
-      y: event.clientY - rect.top + viewport.scrollTop,
+      x: (event.clientX - rect.left + viewport.scrollLeft) / scale,
+      y: (event.clientY - rect.top + viewport.scrollTop) / scale,
     };
   };
 
@@ -1048,7 +1248,7 @@ function bindMindMapEditor(mindMap) {
 
   const updateLines = () => {
     const svg = canvas.querySelector(".mind-map-lines");
-    if (svg) svg.innerHTML = renderMindMapSvg(mindMap);
+    if (svg) svg.innerHTML = renderMindMapSvg(mindMap, canvas);
   };
 
   const scrollNodeIntoView = (id) => {
@@ -1062,6 +1262,8 @@ function bindMindMapEditor(mindMap) {
     requestAnimationFrame(() => {
       const input = [...canvas.querySelectorAll("[data-mind-input]")].find((item) => item.dataset.mindInput === editingId);
       if (!input) return;
+      input.style.height = "auto";
+      input.style.height = `${input.scrollHeight}px`;
       input.focus({ preventScroll: true });
       input.select();
       if (options.scroll) scrollNodeIntoView(editingId);
@@ -1071,12 +1273,13 @@ function bindMindMapEditor(mindMap) {
   const renderMap = () => {
     canvas.innerHTML = `
       <svg class="mind-map-lines" width="${MIND_MAP_CANVAS_WIDTH}" height="${MIND_MAP_CANVAS_HEIGHT}" viewBox="0 0 ${MIND_MAP_CANVAS_WIDTH} ${MIND_MAP_CANVAS_HEIGHT}" aria-hidden="true">
-        ${renderMindMapSvg(mindMap)}
+        ${renderMindMapSvg(mindMap, canvas)}
       </svg>
       ${renderMindMapNodes(mindMap, selectedId, editingId)}
       <div class="mind-map-hint">双击创建节点 · Tab 创建子节点 · Enter 编辑 · Delete 删除</div>
     `;
     count.textContent = `${mindMap.nodes.length} 个节点`;
+    requestAnimationFrame(updateLines);
   };
 
   const startEditing = (id, selectText = true) => {
@@ -1184,6 +1387,9 @@ function bindMindMapEditor(mindMap) {
     if (!input) return;
     const node = getNode(input.dataset.mindInput);
     if (node) node.text = input.value;
+    input.style.height = "auto";
+    input.style.height = `${input.scrollHeight}px`;
+    requestAnimationFrame(updateLines);
   });
 
   canvas.addEventListener("keydown", (event) => {
@@ -1296,6 +1502,18 @@ function detailImageGallery(images = []) {
   `;
 }
 
+function detailFileSection(files = []) {
+  if (!files.length) return "";
+  return `
+    <section class="detail-files">
+      <h3>附件文件</h3>
+      <div class="file-preview-list detail-file-list">
+        ${renderFileList(files, { detail: true })}
+      </div>
+    </section>
+  `;
+}
+
 function closeDetailImagePreview() {
   const modal = document.querySelector(".detail-preview-modal");
   if (modal) modal.remove();
@@ -1396,9 +1614,9 @@ function compressImageFile(file) {
   });
 }
 
-function dataWithDraftImages(editing, draftImages) {
+function dataWithDraftImages(editing, draftImages, draftFiles) {
   const prompts = editing
-    ? state.prompts.map((prompt) => (prompt.id === editing.id ? { ...prompt, images: draftImages } : prompt))
+    ? state.prompts.map((prompt) => (prompt.id === editing.id ? { ...prompt, images: draftImages, files: draftFiles ?? prompt.files ?? [] } : prompt))
     : [
         ...state.prompts,
         normalizePrompt({
@@ -1406,6 +1624,7 @@ function dataWithDraftImages(editing, draftImages) {
           body: "",
           category: state.categories[0] || "其他",
           images: draftImages,
+          files: draftFiles || [],
         }),
       ];
 
@@ -1867,9 +2086,11 @@ function renderEdit(id) {
     note: "",
     favorite: false,
     images: [],
+    files: [],
     mindMap: { nodes: [], edges: [] },
   };
   let draftImages = [...(prompt.images || [])];
+  let draftFiles = [...(prompt.files || [])];
   const draftMindMap = normalizeMindMap(prompt.mindMap);
 
   app.innerHTML = `
@@ -1897,11 +2118,15 @@ function renderEdit(id) {
           </div>
           <div class="mind-map-tools">
             <span id="mindMapCount">0 个节点</span>
+            <span class="mind-map-scale-value" data-mind-scale-value>100%</span>
+            <button class="ghost-button mind-map-reset" type="button" data-mind-scale-reset>重置缩放</button>
             <button class="ghost-button" id="mindMapClear" type="button">清空导图</button>
           </div>
         </div>
         <div class="mind-map-scroll mindmap-viewport">
-          <div class="mind-map-canvas mindmap-canvas" id="mindMapCanvas" tabindex="0" aria-label="思维导图画布"></div>
+          <div class="mindmap-scale-layer">
+            <div class="mind-map-canvas mindmap-canvas" id="mindMapCanvas" tabindex="0" aria-label="思维导图画布"></div>
+          </div>
         </div>
       </section>
       <section class="label image-field">上传图片
@@ -1911,6 +2136,14 @@ function renderEdit(id) {
         </label>
         <input class="file-input" id="imageInput" type="file" accept="image/jpeg,image/png,image/webp" multiple />
         <div class="image-preview-list" id="imagePreviewList"></div>
+      </section>
+      <section class="label image-field file-field">上传文件
+        <label class="image-upload-card file-upload-card" for="fileInput">
+          <span>+ 添加文件</span>
+          <small>支持 PDF、Office、TXT、ZIP、AI、PSD，单个文件不超过 3MB</small>
+        </label>
+        <input class="file-input" id="fileInput" type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.zip,.ai,.psd" multiple />
+        <div class="file-preview-list" id="filePreviewList"></div>
       </section>
       <div class="form-row">
         <label class="label">分类
@@ -1936,13 +2169,14 @@ function renderEdit(id) {
   `;
 
   renderImagePreviews(draftImages);
+  renderFilePreviews(draftFiles);
   bindPromptFormatToolbar();
   bindMindMapEditor(draftMindMap);
 
   document.querySelector("#imageInput").addEventListener("change", async (event) => {
     const nextImages = await readImageFiles(event.target.files || []);
     const candidateImages = [...draftImages, ...nextImages];
-    if (storageRatio(dataWithDraftImages(editing, candidateImages)) > STORAGE_BLOCK_RATIO) {
+    if (storageRatio(dataWithDraftImages(editing, candidateImages, draftFiles)) > STORAGE_BLOCK_RATIO) {
       showToast("本地存储空间不足，请先导出备份或删除部分图片。");
       event.target.value = "";
       return;
@@ -1950,6 +2184,7 @@ function renderEdit(id) {
     draftImages = candidateImages;
     if (editing) {
       editing.images = draftImages;
+      editing.files = draftFiles;
       editing.updatedAt = nowIso();
       save({ mergeExisting: true, cloudPrompt: editing });
     }
@@ -1963,10 +2198,43 @@ function renderEdit(id) {
     draftImages = draftImages.filter((_, index) => index !== Number(button.dataset.removeImage));
     if (editing) {
       editing.images = draftImages;
+      editing.files = draftFiles;
       editing.updatedAt = nowIso();
       save({ mergeExisting: true, cloudPrompt: editing });
     }
     renderImagePreviews(draftImages);
+  });
+
+  document.querySelector("#fileInput").addEventListener("change", async (event) => {
+    const nextFiles = await readPromptFiles(event.target.files || []);
+    const candidateFiles = [...draftFiles, ...nextFiles];
+    if (storageRatio(dataWithDraftImages(editing, draftImages, candidateFiles)) > STORAGE_BLOCK_RATIO) {
+      showToast("本地存储空间不足，请先导出备份或删除部分附件。");
+      event.target.value = "";
+      return;
+    }
+    draftFiles = candidateFiles;
+    if (editing) {
+      editing.images = draftImages;
+      editing.files = draftFiles;
+      editing.updatedAt = nowIso();
+      save({ mergeExisting: true, cloudPrompt: editing });
+    }
+    event.target.value = "";
+    renderFilePreviews(draftFiles);
+  });
+
+  document.querySelector("#filePreviewList").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-remove-file]");
+    if (!button) return;
+    draftFiles = draftFiles.filter((_, index) => index !== Number(button.dataset.removeFile));
+    if (editing) {
+      editing.images = draftImages;
+      editing.files = draftFiles;
+      editing.updatedAt = nowIso();
+      save({ mergeExisting: true, cloudPrompt: editing });
+    }
+    renderFilePreviews(draftFiles);
   });
 
   document.querySelector("#promptForm").addEventListener("submit", (event) => {
@@ -1984,6 +2252,7 @@ function renderEdit(id) {
       note: form.get("note").trim(),
       favorite: form.get("favorite") === "on",
       images: draftImages,
+      files: draftFiles,
       mindMap: normalizeMindMap(draftMindMap),
       updatedAt: nowIso(),
     };
@@ -2025,11 +2294,13 @@ function renderDetail(id) {
           <h2 class="detail-title">${escapeHtml(prompt.title)}</h2>
         </div>
         <div class="actions">
+          <a class="button" href="#/edit/${prompt.id}">${icon("pencil")}编辑</a>
           <button class="icon-button" id="copyBtn">${icon("copy")}复制</button>
           <button class="favorite-button ${prompt.favorite ? "is-active" : ""}" id="favoriteBtn">${icon("heart")}${prompt.favorite ? "已收藏" : "收藏"}</button>
         </div>
       </div>
       ${detailImageGallery(prompt.images)}
+      ${detailFileSection(prompt.files)}
       <div class="prompt-meta detail-meta">
         <span class="pill">${escapeHtml(prompt.category)}</span>
         <span>更新于 ${formatDate(prompt.updatedAt)}</span>
@@ -2042,7 +2313,6 @@ function renderDetail(id) {
       </div>
       ${prompt.note ? `<div class="detail-note"><h3>备注</h3><div class="note-box">${escapeHtml(prompt.note)}</div></div>` : ""}
       <div class="actions">
-        <a class="button" href="#/edit/${prompt.id}">${icon("pencil")}编辑</a>
         <button class="danger-button" id="deleteBtn">${icon("trash")}删除</button>
       </div>
     </article>
@@ -2055,6 +2325,11 @@ function renderDetail(id) {
     const item = event.target.closest("[data-detail-image]");
     if (!item) return;
     openDetailImagePreview(prompt.images || [], Number(item.dataset.detailImage) || 0);
+  });
+  document.querySelector(".detail-files")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-download-file]");
+    if (!button) return;
+    downloadPromptFile((prompt.files || [])[Number(button.dataset.downloadFile)]);
   });
   document.querySelector("#copyBtn").addEventListener("click", async () => {
     const button = document.querySelector("#copyBtn");
