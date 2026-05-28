@@ -2,11 +2,11 @@ const STORAGE_KEY = "promptbox_prompts";
 const TODO_STORAGE_KEY = "promptbox_todos";
 const LOGIN_STORAGE_KEY = "promptbox_private_access_granted";
 const PRIVATE_ACCESS_CODE = "0725";
-const CLOUDBASE_ENV_ID = "请在这里填你的 CloudBase 环境 ID";
-const CLOUDBASE_REGION = "";
-const CLOUD_PROMPTS_COLLECTION = "prompts";
-const CLOUD_TODOS_COLLECTION = "todos";
-const CLOUD_PROMPTS_META_ID = "__promptbox_meta__";
+const SUPABASE_URL = "你的 Supabase URL";
+const SUPABASE_ANON_KEY = "你的 publishable key";
+const SUPABASE_PROMPTS_TABLE = "prompts";
+const SUPABASE_TODOS_TABLE = "todos";
+const SUPABASE_PROMPTS_META_ID = "__promptbox_meta__";
 const LEGACY_STORAGE_KEYS = ["promptbox:data:v1", "prompts", "promptbox-data", "promptboxData"];
 const DB_NAME = "PromptBoxDB";
 const DB_VERSION = 1;
@@ -47,10 +47,10 @@ let dbPromise;
 let saveQueue = Promise.resolve();
 let todoSaveQueue = Promise.resolve();
 let detailPreviewKeyHandler = null;
-let cloudApp = null;
-let cloudDb = null;
-let cloudReady = false;
-let cloudWarningShown = false;
+let supabaseClient = null;
+let supabaseReady = false;
+let syncStatus = "未连接";
+let syncWarningShown = false;
 
 function uid() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
@@ -183,156 +183,151 @@ function normalizeTodo(todo = {}) {
   };
 }
 
-function isCloudConfigured() {
-  return Boolean(
-    window.cloudbase &&
-      CLOUDBASE_ENV_ID &&
-      !CLOUDBASE_ENV_ID.includes("请在这里填")
-  );
-}
-
-async function initCloudBase() {
-  if (cloudDb || cloudReady) return cloudReady;
-  if (!isCloudConfigured()) return false;
+function initSupabase() {
+  if (supabaseClient || supabaseReady) return supabaseReady;
+  if (!window.supabase || !SUPABASE_URL || !SUPABASE_ANON_KEY || SUPABASE_URL.includes("你的 ") || SUPABASE_ANON_KEY.includes("你的 ")) {
+    syncStatus = "未配置";
+    console.error("Supabase 未配置或 SDK 未加载", {
+      hasSdk: Boolean(window.supabase),
+      hasUrl: Boolean(SUPABASE_URL),
+      hasKey: Boolean(SUPABASE_ANON_KEY),
+    });
+    showCloudSyncFailed();
+    return false;
+  }
 
   try {
-    cloudApp = window.cloudbase.init({
-      env: CLOUDBASE_ENV_ID,
-      region: CLOUDBASE_REGION || undefined,
-    });
-    const auth = cloudApp.auth({ persistence: "local" });
-    const loginState = await auth.getLoginState();
-    if (!loginState) {
-      await auth.anonymousAuthProvider().signIn();
-    }
-    cloudDb = cloudApp.database();
-    cloudReady = true;
+    supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    supabaseReady = true;
+    syncStatus = "已连接";
     return true;
   } catch (error) {
-    console.error("CloudBase 初始化失败", error);
-    cloudReady = false;
-    showCloudUnavailable();
+    syncStatus = "连接失败";
+    console.error("Supabase 初始化失败", error);
+    showCloudSyncFailed();
     return false;
   }
 }
 
-function showCloudUnavailable() {
-  if (cloudWarningShown) return;
-  cloudWarningShown = true;
-  showToast("云同步暂不可用，当前显示本地缓存");
+function showCloudSyncFailed() {
+  if (syncWarningShown) return;
+  syncWarningShown = true;
+  showToast("云同步失败");
 }
 
-async function getCloudCollection(name) {
-  const ready = await initCloudBase();
-  return ready && cloudDb ? cloudDb.collection(name) : null;
+function supabaseTable(name) {
+  return initSupabase() && supabaseClient ? supabaseClient.from(name) : null;
 }
 
-async function readCloudCollection(name, normalizer) {
-  const collection = await getCloudCollection(name);
-  if (!collection) return null;
+function cloudRowPayload(row = {}) {
+  return row.data && typeof row.data === "object" ? row.data : row;
+}
+
+async function readSupabaseTable(name, normalizer) {
+  const table = supabaseTable(name);
+  if (!table) return null;
 
   try {
-    const result = await collection.limit(1000).get();
-    return (result.data || []).map((item) => normalizer(item));
+    const { data, error } = await table.select("*").limit(1000);
+    if (error) throw error;
+    syncStatus = "已连接";
+    return (data || []).map((row) => normalizer(cloudRowPayload(row)));
   } catch (error) {
-    console.error(`读取 CloudBase 集合 ${name} 失败`, error);
-    showCloudUnavailable();
+    syncStatus = "读取失败";
+    console.error(`读取 Supabase 表 ${name} 失败`, error);
+    showCloudSyncFailed();
     return null;
   }
 }
 
-async function readCloudPromptData() {
-  const collection = await getCloudCollection(CLOUD_PROMPTS_COLLECTION);
-  if (!collection) return null;
+async function readSupabasePrompts() {
+  const table = supabaseTable(SUPABASE_PROMPTS_TABLE);
+  if (!table) return null;
 
   try {
-    const result = await collection.limit(1000).get();
-    const docs = result.data || [];
-    const meta = docs.find((item) => item.id === CLOUD_PROMPTS_META_ID);
-    const prompts = docs.filter((item) => item.id !== CLOUD_PROMPTS_META_ID).map(normalizePrompt);
-    return normalizeData({ categories: meta?.categories || [], prompts });
+    const { data, error } = await table.select("*").limit(1000);
+    if (error) throw error;
+    const rows = data || [];
+    const metaRow = rows.find((row) => row.id === SUPABASE_PROMPTS_META_ID);
+    const meta = cloudRowPayload(metaRow || {});
+    const prompts = rows
+      .filter((row) => row.id !== SUPABASE_PROMPTS_META_ID)
+      .map((row) => normalizePrompt(cloudRowPayload(row)));
+    syncStatus = "已连接";
+    return { categories: Array.isArray(meta.categories) ? meta.categories : [], prompts };
   } catch (error) {
-    console.error("读取 CloudBase Prompt 数据失败", error);
-    showCloudUnavailable();
+    syncStatus = "读取失败";
+    console.error("读取 Supabase prompts 失败", error);
+    showCloudSyncFailed();
     return null;
   }
 }
 
-async function syncCloudCollection(name, items, normalizer) {
-  const collection = await getCloudCollection(name);
-  if (!collection) return false;
+async function writeSupabaseTable(name, items, normalizer) {
+  const table = supabaseTable(name);
+  if (!table) return false;
 
   try {
     const normalizedItems = items.map(normalizer);
-    const cloudItems = (await collection.limit(1000).get()).data || [];
-    const cloudById = new Map(cloudItems.filter((item) => item.id).map((item) => [item.id, item]));
+    const { data: existingRows, error: readError } = await table.select("id").limit(1000);
+    if (readError) throw readError;
+
     const nextIds = new Set(normalizedItems.map((item) => item.id));
+    const staleIds = (existingRows || []).map((row) => row.id).filter((id) => id && !nextIds.has(id));
+    await Promise.all(staleIds.map((id) => table.delete().eq("id", id)));
 
-    await Promise.all(
-      cloudItems
-        .filter((item) => item.id && !nextIds.has(item.id))
-        .map((item) => collection.doc(item._id).remove())
-    );
+    if (normalizedItems.length) {
+      const rows = normalizedItems.map((item) => ({ id: item.id, data: item, updated_at: nowIso() }));
+      const { error } = await table.upsert(rows, { onConflict: "id" });
+      if (error) throw error;
+    }
 
-    await Promise.all(
-      normalizedItems.map((item) => {
-        const existing = cloudById.get(item.id);
-        if (existing?._id) {
-          return collection.doc(existing._id).update(item);
-        }
-        return collection.add(item);
-      })
-    );
-
+    syncStatus = `已同步 ${formatDate(nowIso())}`;
     showToast("已同步");
     return true;
   } catch (error) {
-    console.error(`同步 CloudBase 集合 ${name} 失败`, error);
-    showCloudUnavailable();
+    syncStatus = "同步失败";
+    console.error(`同步 Supabase 表 ${name} 失败`, error);
+    showCloudSyncFailed();
     return false;
   }
 }
 
-async function syncCloudPrompts(data) {
-  const collection = await getCloudCollection(CLOUD_PROMPTS_COLLECTION);
-  if (!collection) return false;
+async function writeSupabasePrompts(data = currentData()) {
+  const table = supabaseTable(SUPABASE_PROMPTS_TABLE);
+  if (!table) return false;
 
   try {
     const normalized = normalizeData(data);
-    const cloudItems = (await collection.limit(1000).get()).data || [];
-    const cloudById = new Map(cloudItems.filter((item) => item.id).map((item) => [item.id, item]));
+    const { data: existingRows, error: readError } = await table.select("id").limit(1000);
+    if (readError) throw readError;
+
     const promptIds = new Set(normalized.prompts.map((prompt) => prompt.id));
+    const staleIds = (existingRows || [])
+      .map((row) => row.id)
+      .filter((id) => id && id !== SUPABASE_PROMPTS_META_ID && !promptIds.has(id));
+    await Promise.all(staleIds.map((id) => table.delete().eq("id", id)));
 
-    await Promise.all(
-      cloudItems
-        .filter((item) => item.id && item.id !== CLOUD_PROMPTS_META_ID && !promptIds.has(item.id))
-        .map((item) => collection.doc(item._id).remove())
-    );
+    const rows = normalized.prompts.map((prompt) => ({ id: prompt.id, data: prompt, updated_at: nowIso() }));
+    rows.push({
+      id: SUPABASE_PROMPTS_META_ID,
+      data: { id: SUPABASE_PROMPTS_META_ID, categories: normalized.categories, updatedAt: nowIso() },
+      updated_at: nowIso(),
+    });
 
-    await Promise.all(
-      normalized.prompts.map((prompt) => {
-        const existing = cloudById.get(prompt.id);
-        return existing?._id ? collection.doc(existing._id).update(prompt) : collection.add(prompt);
-      })
-    );
+    const { error } = await table.upsert(rows, { onConflict: "id" });
+    if (error) throw error;
 
-    const meta = { id: CLOUD_PROMPTS_META_ID, type: "meta", categories: normalized.categories, updatedAt: nowIso() };
-    const existingMeta = cloudById.get(CLOUD_PROMPTS_META_ID);
-    if (existingMeta?._id) {
-      await collection.doc(existingMeta._id).update(meta);
-    } else {
-      await collection.add(meta);
-    }
-
+    syncStatus = `已同步 ${formatDate(nowIso())}`;
     showToast("已同步");
     return true;
   } catch (error) {
-    console.error("同步 CloudBase Prompt 数据失败", error);
-    showCloudUnavailable();
+    syncStatus = "同步失败";
+    console.error("同步 Supabase prompts 失败", error);
+    showCloudSyncFailed();
     return false;
   }
 }
-
 function isLoggedIn() {
   return localStorage.getItem(LOGIN_STORAGE_KEY) === "true";
 }
@@ -355,8 +350,8 @@ function logoutPrivateAccess() {
 
 async function loadTodos() {
   try {
-    const cloudTodos = await readCloudCollection(CLOUD_TODOS_COLLECTION, normalizeTodo);
-    if (cloudTodos) {
+    const cloudTodos = await readSupabaseTable(SUPABASE_TODOS_TABLE, normalizeTodo);
+    if (cloudTodos && cloudTodos.length) {
       state.todos = cloudTodos.filter((todo) => todo.content);
       localStorage.setItem(TODO_STORAGE_KEY, JSON.stringify(state.todos.map(normalizeTodo)));
       return;
@@ -374,10 +369,10 @@ function saveTodos() {
   const snapshot = state.todos.map(normalizeTodo);
   localStorage.setItem(TODO_STORAGE_KEY, JSON.stringify(snapshot));
   todoSaveQueue = todoSaveQueue
-    .then(() => syncCloudCollection(CLOUD_TODOS_COLLECTION, snapshot, normalizeTodo))
+    .then(() => writeSupabaseTable(SUPABASE_TODOS_TABLE, snapshot, normalizeTodo))
     .catch((error) => {
       console.error("保存 Todo 数据失败", error);
-      showCloudUnavailable();
+      showCloudSyncFailed();
     });
   return todoSaveQueue;
 }
@@ -546,8 +541,9 @@ function currentData() {
 }
 
 async function loadPrompts() {
-  const cloudData = await readCloudPromptData();
-  if (cloudData) {
+  const cloudData = await readSupabasePrompts();
+  if (cloudData && cloudData.prompts.length) {
+    localStorage.setItem(MIGRATION_META_KEY, "true");
     const categories = [...DEFAULT_CATEGORIES, ...cloudData.categories];
     return normalizeData({ categories, prompts: cloudData.prompts });
   }
@@ -563,8 +559,31 @@ async function savePrompts(data = currentData(), options = {}) {
   localStorage.setItem(STORAGE_KEY, serialized);
   state.categories = next.categories;
   state.prompts = next.prompts;
-  await syncCloudPrompts(next);
+  await writeSupabasePrompts(next);
   return next;
+}
+
+async function syncFromCloud() {
+  const cloudPrompts = await readSupabasePrompts();
+  const cloudTodos = await readSupabaseTable(SUPABASE_TODOS_TABLE, normalizeTodo);
+
+  if (cloudPrompts && cloudPrompts.prompts.length) {
+    const next = normalizeData({
+      categories: [...DEFAULT_CATEGORIES, ...cloudPrompts.categories],
+      prompts: cloudPrompts.prompts,
+    });
+    state.categories = next.categories;
+    state.prompts = next.prompts;
+    localStorage.setItem(STORAGE_KEY, serializedData(next));
+    localStorage.setItem(MIGRATION_META_KEY, "true");
+  }
+
+  if (cloudTodos && cloudTodos.length) {
+    state.todos = cloudTodos.filter((todo) => todo.content);
+    localStorage.setItem(TODO_STORAGE_KEY, JSON.stringify(state.todos.map(normalizeTodo)));
+  }
+
+  return Boolean((cloudPrompts && cloudPrompts.prompts.length) || (cloudTodos && cloudTodos.length));
 }
 
 async function load() {
@@ -2075,7 +2094,7 @@ function deleteCategory(name) {
   renderCategories();
 }
 
-async function migrateLocalDataToCloud() {
+async function uploadLocalDataToCloud() {
   const localPrompts = readStorageData(STORAGE_KEY);
   let localTodos = [];
 
@@ -2098,8 +2117,8 @@ async function migrateLocalDataToCloud() {
   localStorage.setItem(STORAGE_KEY, serializedData(currentData()));
   localStorage.setItem(TODO_STORAGE_KEY, JSON.stringify(state.todos.map(normalizeTodo)));
 
-  const promptsSynced = await syncCloudPrompts(currentData());
-  const todosSynced = await syncCloudCollection(CLOUD_TODOS_COLLECTION, state.todos, normalizeTodo);
+  const promptsSynced = await writeSupabasePrompts(currentData());
+  const todosSynced = await writeSupabaseTable(SUPABASE_TODOS_TABLE, state.todos, normalizeTodo);
 
   if (promptsSynced || todosSynced) {
     showToast("本地数据已迁移到云端");
@@ -2134,7 +2153,11 @@ function renderSettings() {
               : ""
           }
         </div>
+        <div class="storage-debug">
+          <span>云同步状态：${escapeHtml(syncStatus)}</span>
+        </div>
         <button class="ghost-button" id="testSaveBtn">${icon("check")}测试保存</button>
+        <button class="ghost-button" id="manualSyncBtn">${icon("check")}手动同步</button>
         <button class="ghost-button" id="migrateCloudBtn">${icon("upload")}迁移本地数据到云端</button>
         <button class="ghost-button" id="logoutBtn">${icon("x")}退出登录</button>
         <button class="danger-button" id="clearBtn">${icon("trash")}清空本地数据</button>
@@ -2164,8 +2187,12 @@ function renderSettings() {
     showToast("测试 Prompt 已保存");
     renderSettings();
   });
+  document.querySelector("#manualSyncBtn").addEventListener("click", async () => {
+    await uploadLocalDataToCloud();
+    renderSettings();
+  });
   document.querySelector("#migrateCloudBtn").addEventListener("click", async () => {
-    await migrateLocalDataToCloud();
+    await uploadLocalDataToCloud();
     renderSettings();
   });
   document.querySelector("#logoutBtn").addEventListener("click", logoutPrivateAccess);
@@ -2255,7 +2282,7 @@ async function init() {
 
   showAppShell();
   try {
-    await initCloudBase();
+    initSupabase();
     await load();
     await loadTodos();
     cleanupTodos();
