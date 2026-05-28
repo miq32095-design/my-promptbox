@@ -1,0 +1,24 @@
+{
+  "name": "promptbox",
+  "version": "1.0.0",
+  "description": "",
+  "main": "app.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/miq32095-design/my-promptbox.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/miq32095-design/my-promptbox/issues"
+  },
+  "homepage": "https://github.com/miq32095-design/my-promptbox#readme",
+  "dependencies": {
+    "vite": "^8.0.14"
+  }
+}
