@@ -1,5 +1,12 @@
 const STORAGE_KEY = "promptbox_prompts";
 const TODO_STORAGE_KEY = "promptbox_todos";
+const LOGIN_STORAGE_KEY = "promptbox_private_access_granted";
+const PRIVATE_ACCESS_CODE = "0725";
+const CLOUDBASE_ENV_ID = "请在这里填你的 CloudBase 环境 ID";
+const CLOUDBASE_REGION = "";
+const CLOUD_PROMPTS_COLLECTION = "prompts";
+const CLOUD_TODOS_COLLECTION = "todos";
+const CLOUD_PROMPTS_META_ID = "__promptbox_meta__";
 const LEGACY_STORAGE_KEYS = ["promptbox:data:v1", "prompts", "promptbox-data", "promptboxData"];
 const DB_NAME = "PromptBoxDB";
 const DB_VERSION = 1;
@@ -31,9 +38,19 @@ const app = document.querySelector("#app");
 const pageTitle = document.querySelector("#pageTitle");
 const pageKicker = document.querySelector("#pageKicker");
 const toast = document.querySelector("#toast");
+const appShell = document.querySelector(".app-shell");
+const loginView = document.querySelector("#loginView");
+const loginForm = document.querySelector("#loginForm");
+const loginPassword = document.querySelector("#loginPassword");
+const loginError = document.querySelector("#loginError");
 let dbPromise;
 let saveQueue = Promise.resolve();
+let todoSaveQueue = Promise.resolve();
 let detailPreviewKeyHandler = null;
+let cloudApp = null;
+let cloudDb = null;
+let cloudReady = false;
+let cloudWarningShown = false;
 
 function uid() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
@@ -166,8 +183,185 @@ function normalizeTodo(todo = {}) {
   };
 }
 
-function loadTodos() {
+function isCloudConfigured() {
+  return Boolean(
+    window.cloudbase &&
+      CLOUDBASE_ENV_ID &&
+      !CLOUDBASE_ENV_ID.includes("请在这里填")
+  );
+}
+
+async function initCloudBase() {
+  if (cloudDb || cloudReady) return cloudReady;
+  if (!isCloudConfigured()) return false;
+
   try {
+    cloudApp = window.cloudbase.init({
+      env: CLOUDBASE_ENV_ID,
+      region: CLOUDBASE_REGION || undefined,
+    });
+    const auth = cloudApp.auth({ persistence: "local" });
+    const loginState = await auth.getLoginState();
+    if (!loginState) {
+      await auth.anonymousAuthProvider().signIn();
+    }
+    cloudDb = cloudApp.database();
+    cloudReady = true;
+    return true;
+  } catch (error) {
+    console.error("CloudBase 初始化失败", error);
+    cloudReady = false;
+    showCloudUnavailable();
+    return false;
+  }
+}
+
+function showCloudUnavailable() {
+  if (cloudWarningShown) return;
+  cloudWarningShown = true;
+  showToast("云同步暂不可用，当前显示本地缓存");
+}
+
+async function getCloudCollection(name) {
+  const ready = await initCloudBase();
+  return ready && cloudDb ? cloudDb.collection(name) : null;
+}
+
+async function readCloudCollection(name, normalizer) {
+  const collection = await getCloudCollection(name);
+  if (!collection) return null;
+
+  try {
+    const result = await collection.limit(1000).get();
+    return (result.data || []).map((item) => normalizer(item));
+  } catch (error) {
+    console.error(`读取 CloudBase 集合 ${name} 失败`, error);
+    showCloudUnavailable();
+    return null;
+  }
+}
+
+async function readCloudPromptData() {
+  const collection = await getCloudCollection(CLOUD_PROMPTS_COLLECTION);
+  if (!collection) return null;
+
+  try {
+    const result = await collection.limit(1000).get();
+    const docs = result.data || [];
+    const meta = docs.find((item) => item.id === CLOUD_PROMPTS_META_ID);
+    const prompts = docs.filter((item) => item.id !== CLOUD_PROMPTS_META_ID).map(normalizePrompt);
+    return normalizeData({ categories: meta?.categories || [], prompts });
+  } catch (error) {
+    console.error("读取 CloudBase Prompt 数据失败", error);
+    showCloudUnavailable();
+    return null;
+  }
+}
+
+async function syncCloudCollection(name, items, normalizer) {
+  const collection = await getCloudCollection(name);
+  if (!collection) return false;
+
+  try {
+    const normalizedItems = items.map(normalizer);
+    const cloudItems = (await collection.limit(1000).get()).data || [];
+    const cloudById = new Map(cloudItems.filter((item) => item.id).map((item) => [item.id, item]));
+    const nextIds = new Set(normalizedItems.map((item) => item.id));
+
+    await Promise.all(
+      cloudItems
+        .filter((item) => item.id && !nextIds.has(item.id))
+        .map((item) => collection.doc(item._id).remove())
+    );
+
+    await Promise.all(
+      normalizedItems.map((item) => {
+        const existing = cloudById.get(item.id);
+        if (existing?._id) {
+          return collection.doc(existing._id).update(item);
+        }
+        return collection.add(item);
+      })
+    );
+
+    showToast("已同步");
+    return true;
+  } catch (error) {
+    console.error(`同步 CloudBase 集合 ${name} 失败`, error);
+    showCloudUnavailable();
+    return false;
+  }
+}
+
+async function syncCloudPrompts(data) {
+  const collection = await getCloudCollection(CLOUD_PROMPTS_COLLECTION);
+  if (!collection) return false;
+
+  try {
+    const normalized = normalizeData(data);
+    const cloudItems = (await collection.limit(1000).get()).data || [];
+    const cloudById = new Map(cloudItems.filter((item) => item.id).map((item) => [item.id, item]));
+    const promptIds = new Set(normalized.prompts.map((prompt) => prompt.id));
+
+    await Promise.all(
+      cloudItems
+        .filter((item) => item.id && item.id !== CLOUD_PROMPTS_META_ID && !promptIds.has(item.id))
+        .map((item) => collection.doc(item._id).remove())
+    );
+
+    await Promise.all(
+      normalized.prompts.map((prompt) => {
+        const existing = cloudById.get(prompt.id);
+        return existing?._id ? collection.doc(existing._id).update(prompt) : collection.add(prompt);
+      })
+    );
+
+    const meta = { id: CLOUD_PROMPTS_META_ID, type: "meta", categories: normalized.categories, updatedAt: nowIso() };
+    const existingMeta = cloudById.get(CLOUD_PROMPTS_META_ID);
+    if (existingMeta?._id) {
+      await collection.doc(existingMeta._id).update(meta);
+    } else {
+      await collection.add(meta);
+    }
+
+    showToast("已同步");
+    return true;
+  } catch (error) {
+    console.error("同步 CloudBase Prompt 数据失败", error);
+    showCloudUnavailable();
+    return false;
+  }
+}
+
+function isLoggedIn() {
+  return localStorage.getItem(LOGIN_STORAGE_KEY) === "true";
+}
+
+function showLogin() {
+  if (appShell) appShell.hidden = true;
+  if (loginView) loginView.hidden = false;
+  loginPassword?.focus();
+}
+
+function showAppShell() {
+  if (loginView) loginView.hidden = true;
+  if (appShell) appShell.hidden = false;
+}
+
+function logoutPrivateAccess() {
+  localStorage.removeItem(LOGIN_STORAGE_KEY);
+  showLogin();
+}
+
+async function loadTodos() {
+  try {
+    const cloudTodos = await readCloudCollection(CLOUD_TODOS_COLLECTION, normalizeTodo);
+    if (cloudTodos) {
+      state.todos = cloudTodos.filter((todo) => todo.content);
+      localStorage.setItem(TODO_STORAGE_KEY, JSON.stringify(state.todos.map(normalizeTodo)));
+      return;
+    }
+
     const raw = localStorage.getItem(TODO_STORAGE_KEY);
     state.todos = raw ? JSON.parse(raw).map(normalizeTodo).filter((todo) => todo.content) : [];
   } catch (error) {
@@ -177,7 +371,15 @@ function loadTodos() {
 }
 
 function saveTodos() {
-  localStorage.setItem(TODO_STORAGE_KEY, JSON.stringify(state.todos.map(normalizeTodo)));
+  const snapshot = state.todos.map(normalizeTodo);
+  localStorage.setItem(TODO_STORAGE_KEY, JSON.stringify(snapshot));
+  todoSaveQueue = todoSaveQueue
+    .then(() => syncCloudCollection(CLOUD_TODOS_COLLECTION, snapshot, normalizeTodo))
+    .catch((error) => {
+      console.error("保存 Todo 数据失败", error);
+      showCloudUnavailable();
+    });
+  return todoSaveQueue;
 }
 
 function cleanupTodos() {
@@ -344,6 +546,11 @@ function currentData() {
 }
 
 async function loadPrompts() {
+  const cloudData = await readCloudPromptData();
+  if (cloudData) {
+    const categories = [...DEFAULT_CATEGORIES, ...cloudData.categories];
+    return normalizeData({ categories, prompts: cloudData.prompts });
+  }
   return readStorageData(STORAGE_KEY);
 }
 
@@ -356,6 +563,7 @@ async function savePrompts(data = currentData(), options = {}) {
   localStorage.setItem(STORAGE_KEY, serialized);
   state.categories = next.categories;
   state.prompts = next.prompts;
+  await syncCloudPrompts(next);
   return next;
 }
 
@@ -1867,6 +2075,37 @@ function deleteCategory(name) {
   renderCategories();
 }
 
+async function migrateLocalDataToCloud() {
+  const localPrompts = readStorageData(STORAGE_KEY);
+  let localTodos = [];
+
+  try {
+    const rawTodos = localStorage.getItem(TODO_STORAGE_KEY);
+    localTodos = rawTodos ? JSON.parse(rawTodos).map(normalizeTodo).filter((todo) => todo.content) : [];
+  } catch (error) {
+    console.error("读取本地 Todo 迁移数据失败", error);
+  }
+
+  const mergedPrompts = mergeDataSets(currentData(), localPrompts);
+  const todoMap = new Map(state.todos.map((todo) => [todo.id, normalizeTodo(todo)]));
+  localTodos.forEach((todo) => {
+    if (!todoMap.has(todo.id)) todoMap.set(todo.id, normalizeTodo(todo));
+  });
+
+  state.categories = mergedPrompts.categories;
+  state.prompts = mergedPrompts.prompts;
+  state.todos = [...todoMap.values()];
+  localStorage.setItem(STORAGE_KEY, serializedData(currentData()));
+  localStorage.setItem(TODO_STORAGE_KEY, JSON.stringify(state.todos.map(normalizeTodo)));
+
+  const promptsSynced = await syncCloudPrompts(currentData());
+  const todosSynced = await syncCloudCollection(CLOUD_TODOS_COLLECTION, state.todos, normalizeTodo);
+
+  if (promptsSynced || todosSynced) {
+    showToast("本地数据已迁移到云端");
+  }
+}
+
 function renderSettings() {
   setTitle("设置");
   const usage = localStorageUsage();
@@ -1896,6 +2135,8 @@ function renderSettings() {
           }
         </div>
         <button class="ghost-button" id="testSaveBtn">${icon("check")}测试保存</button>
+        <button class="ghost-button" id="migrateCloudBtn">${icon("upload")}迁移本地数据到云端</button>
+        <button class="ghost-button" id="logoutBtn">${icon("x")}退出登录</button>
         <button class="danger-button" id="clearBtn">${icon("trash")}清空本地数据</button>
       </div>
     </section>
@@ -1923,11 +2164,18 @@ function renderSettings() {
     showToast("测试 Prompt 已保存");
     renderSettings();
   });
+  document.querySelector("#migrateCloudBtn").addEventListener("click", async () => {
+    await migrateLocalDataToCloud();
+    renderSettings();
+  });
+  document.querySelector("#logoutBtn").addEventListener("click", logoutPrivateAccess);
   document.querySelector("#clearBtn").addEventListener("click", () => {
     if (!confirm("确定清空本地数据吗？")) return;
     state.prompts = [];
     state.categories = [...DEFAULT_CATEGORIES];
-    save();
+    state.todos = [];
+    localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(TODO_STORAGE_KEY);
     showToast("本地数据已清空");
     renderSettings();
   });
@@ -1941,6 +2189,7 @@ function exportJson() {
           version: 1,
           categories: state.categories,
           prompts: state.prompts,
+          todos: state.todos,
           exportedAt: nowIso(),
         },
         null,
@@ -1976,6 +2225,12 @@ function importJson(event) {
       state.prompts.forEach((prompt) => {
         if (!state.categories.includes(prompt.category)) prompt.category = "其他";
       });
+      if (Array.isArray(parsed.todos)) {
+        const todoMap = new Map(state.todos.map((todo) => [todo.id, normalizeTodo(todo)]));
+        parsed.todos.map(normalizeTodo).filter((todo) => todo.content).forEach((todo) => todoMap.set(todo.id, todo));
+        state.todos = [...todoMap.values()];
+        saveTodos();
+      }
       save({ mergeExisting: true });
       showToast("数据已导入");
       renderSettings();
@@ -1993,9 +2248,16 @@ function empty(text) {
 window.addEventListener("hashchange", render);
 
 async function init() {
+  if (!isLoggedIn()) {
+    showLogin();
+    return;
+  }
+
+  showAppShell();
   try {
+    await initCloudBase();
     await load();
-    loadTodos();
+    await loadTodos();
     cleanupTodos();
     render();
   } catch (error) {
@@ -2003,5 +2265,17 @@ async function init() {
     app.innerHTML = empty("数据加载失败，请刷新页面重试");
   }
 }
+
+loginForm?.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const code = loginPassword?.value || "";
+  if (code !== PRIVATE_ACCESS_CODE) {
+    if (loginError) loginError.textContent = "访问密码不正确";
+    return;
+  }
+  localStorage.setItem(LOGIN_STORAGE_KEY, "true");
+  if (loginError) loginError.textContent = "";
+  init();
+});
 
 init();

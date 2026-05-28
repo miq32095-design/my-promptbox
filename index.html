@@ -8,7 +8,30 @@
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <div class="app-shell">
+    <section id="loginView" class="login-view" hidden>
+      <form class="login-card" id="loginForm">
+        <div class="brand login-brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 32 32" fill="none">
+              <rect x="7" y="5" width="16" height="20" rx="5" fill="currentColor" opacity="0.18" />
+              <rect x="10" y="8" width="16" height="20" rx="5" fill="currentColor" opacity="0.88" />
+              <path d="M15 16.2h4.2a2.3 2.3 0 0 0 0-4.6H15V22" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </span>
+          <span>
+            <strong>PromptBox</strong>
+            <small>私人云同步工具</small>
+          </span>
+        </div>
+        <label class="label">访问密码
+          <input class="field" id="loginPassword" type="password" autocomplete="current-password" required />
+        </label>
+        <p class="login-error" id="loginError" role="alert"></p>
+        <button class="button" type="submit">进入 PromptBox</button>
+      </form>
+    </section>
+
+    <div class="app-shell" hidden>
       <aside class="sidebar">
         <a class="brand" href="#/">
           <span class="brand-mark" aria-hidden="true">
@@ -73,6 +96,7 @@
     </div>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="https://static.cloudbase.net/cloudbase-js-sdk/2.8.1/cloudbase.full.js"></script>
     <script src="./app.js"></script>
   </body>
 </html>
