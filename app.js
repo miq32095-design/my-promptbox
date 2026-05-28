@@ -2,8 +2,8 @@ const STORAGE_KEY = "promptbox_prompts";
 const TODO_STORAGE_KEY = "promptbox_todos";
 const LOGIN_STORAGE_KEY = "promptbox_private_access_granted";
 const PRIVATE_ACCESS_CODE = "0725";
-const SUPABASE_URL = "你的 Supabase URL";
-const SUPABASE_ANON_KEY = "你的 publishable key";
+const SUPABASE_URL = "https://kgzyxocfqnhyonvdkzyp.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_oILIc_FJ6so9OyB54LPe7A_4X2PHd1p";
 const SUPABASE_PROMPTS_TABLE = "prompts";
 const SUPABASE_TODOS_TABLE = "todos";
 const SUPABASE_PROMPTS_META_ID = "__promptbox_meta__";
@@ -185,7 +185,7 @@ function normalizeTodo(todo = {}) {
 
 function initSupabase() {
   if (supabaseClient || supabaseReady) return supabaseReady;
-  if (!window.supabase || !SUPABASE_URL || !SUPABASE_ANON_KEY || SUPABASE_URL.includes("你的 ") || SUPABASE_ANON_KEY.includes("你的 ")) {
+  if (!window.supabase) {
     syncStatus = "未配置";
     console.error("Supabase 未配置或 SDK 未加载", {
       hasSdk: Boolean(window.supabase),
@@ -210,13 +210,12 @@ function initSupabase() {
 }
 
 function showCloudSyncFailed() {
-  if (syncWarningShown) return;
   syncWarningShown = true;
   showToast("云同步失败");
 }
 
 function supabaseTable(name) {
-  return initSupabase() && supabaseClient ? supabaseClient.from(name) : null;
+  return initSupabase() && supabaseClient && name === SUPABASE_PROMPTS_TABLE ? supabaseClient.from(name) : null;
 }
 
 function cloudRowPayload(row = {}) {
@@ -541,16 +540,16 @@ function currentData() {
 }
 
 async function loadPrompts() {
-  const cloudData = await readSupabasePrompts();
+  const cloudData = await syncPromptsFromCloud();
   if (cloudData && cloudData.prompts.length) {
     localStorage.setItem(MIGRATION_META_KEY, "true");
-    const categories = [...DEFAULT_CATEGORIES, ...cloudData.categories];
-    return normalizeData({ categories, prompts: cloudData.prompts });
+    return cloudData;
   }
   return readStorageData(STORAGE_KEY);
 }
 
 async function savePrompts(data = currentData(), options = {}) {
+  const previous = readStorageData(STORAGE_KEY);
   const normalized = normalizeData(data);
   const existing = options.mergeExisting ? await loadPrompts() : null;
   const next = options.mergeExisting ? mergeDataSets(existing, normalized) : normalized;
@@ -559,8 +558,80 @@ async function savePrompts(data = currentData(), options = {}) {
   localStorage.setItem(STORAGE_KEY, serialized);
   state.categories = next.categories;
   state.prompts = next.prompts;
-  await writeSupabasePrompts(next);
+  const nextIds = new Set(next.prompts.map((prompt) => prompt.id));
+  const deletedIds = options.deletedPromptIds || (previous?.prompts || []).map((prompt) => prompt.id).filter((id) => id && !nextIds.has(id));
+  const syncTargets = options.cloudPrompt ? [normalizePrompt(options.cloudPrompt)] : next.prompts;
+  await Promise.all([
+    ...syncTargets.map(syncPromptToCloud),
+    ...deletedIds.map(deletePromptFromCloud),
+  ]);
   return next;
+}
+
+async function syncPromptsFromCloud() {
+  const table = supabaseTable(SUPABASE_PROMPTS_TABLE);
+  if (!table) return null;
+
+  try {
+    const { data, error } = await table.select("id,data,created_at").limit(1000);
+    if (error) throw error;
+    const prompts = (data || [])
+      .map((row) => row.data)
+      .filter((prompt) => prompt && typeof prompt === "object")
+      .map(normalizePrompt);
+
+    if (!prompts.length) return null;
+
+    const next = normalizeData({ prompts });
+    localStorage.setItem(STORAGE_KEY, serializedData(next));
+    syncStatus = "已连接";
+    return next;
+  } catch (error) {
+    syncStatus = "读取失败";
+    console.error("读取 Supabase prompts 失败", error);
+    showCloudSyncFailed();
+    return null;
+  }
+}
+
+async function syncPromptToCloud(prompt) {
+  const table = supabaseTable(SUPABASE_PROMPTS_TABLE);
+  if (!table || !prompt?.id) return false;
+
+  try {
+    const normalized = normalizePrompt(prompt);
+    console.log("准备同步到 Supabase", normalized);
+    const { data, error } = await table.upsert({
+      id: normalized.id,
+      data: normalized,
+    });
+    console.log("Supabase 同步结果", data, error);
+    if (error) throw error;
+    syncStatus = `已同步 ${formatDate(nowIso())}`;
+    return true;
+  } catch (error) {
+    syncStatus = "同步失败";
+    console.error("Supabase 写入失败", error);
+    showCloudSyncFailed();
+    return false;
+  }
+}
+
+async function deletePromptFromCloud(id) {
+  const table = supabaseTable(SUPABASE_PROMPTS_TABLE);
+  if (!table || !id) return false;
+
+  try {
+    const { error } = await table.delete().eq("id", id);
+    if (error) throw error;
+    syncStatus = `已同步 ${formatDate(nowIso())}`;
+    return true;
+  } catch (error) {
+    syncStatus = "同步失败";
+    console.error("删除 Supabase prompt 失败", error);
+    showCloudSyncFailed();
+    return false;
+  }
 }
 
 async function syncFromCloud() {
@@ -1778,7 +1849,7 @@ function renderPromptList() {
     const selectedIds = new Set(state.management.selected);
     state.prompts = state.prompts.filter((prompt) => !selectedIds.has(prompt.id));
     state.management.selected.clear();
-    save();
+    save({ deletedPromptIds: [...selectedIds] });
     showToast("已删除所选 Prompt");
     renderPromptList();
   });
@@ -1880,7 +1951,7 @@ function renderEdit(id) {
     if (editing) {
       editing.images = draftImages;
       editing.updatedAt = nowIso();
-      save({ mergeExisting: true });
+      save({ mergeExisting: true, cloudPrompt: editing });
     }
     event.target.value = "";
     renderImagePreviews(draftImages);
@@ -1893,7 +1964,7 @@ function renderEdit(id) {
     if (editing) {
       editing.images = draftImages;
       editing.updatedAt = nowIso();
-      save({ mergeExisting: true });
+      save({ mergeExisting: true, cloudPrompt: editing });
     }
     renderImagePreviews(draftImages);
   });
@@ -1920,7 +1991,7 @@ function renderEdit(id) {
     if (editing) {
       Object.assign(editing, next);
       showToast("已更新");
-      save({ mergeExisting: true });
+      save({ mergeExisting: true, cloudPrompt: editing });
       location.hash = `#/detail/${editing.id}`;
       return;
     }
@@ -1931,7 +2002,7 @@ function renderEdit(id) {
       createdAt: nowIso(),
     };
     state.prompts.unshift(created);
-    save({ mergeExisting: true });
+    save({ mergeExisting: true, cloudPrompt: created });
     showToast("已保存");
     location.hash = `#/detail/${created.id}`;
   });
@@ -1999,13 +2070,13 @@ function renderDetail(id) {
   document.querySelector("#favoriteBtn").addEventListener("click", () => {
     prompt.favorite = !prompt.favorite;
     prompt.updatedAt = nowIso();
-    save({ mergeExisting: true });
+    save({ mergeExisting: true, cloudPrompt: prompt });
     renderDetail(id);
   });
   document.querySelector("#deleteBtn").addEventListener("click", () => {
     if (!confirm("确定删除这个 Prompt 吗？")) return;
     state.prompts = state.prompts.filter((item) => item.id !== id);
-    save();
+    save({ deletedPromptIds: [id] });
     showToast("已删除");
     location.hash = "#/prompts";
   });
